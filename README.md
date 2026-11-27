@@ -303,7 +303,7 @@ Report security issues through the process in [SECURITY.md](SECURITY.md). Do not
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md). The project has no runtime or development dependencies. Tests use the built-in Node.js test runner.
+See [CONTRIBUTING.md](CONTRIBUTING.md). The project has zero runtime dependencies. Core tests use the built-in Node.js test runner, and fast-check is limited to development-only property fuzzing.
 
 ## License
 
