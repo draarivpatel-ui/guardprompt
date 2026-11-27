@@ -1,0 +1,67 @@
+{
+  "name": "guardprompt",
+  "version": "1.0.0",
+  "description": "Zero-dependency Unicode, indirect prompt-injection, encoded-payload, and LLM output exfiltration firewall for Node.js",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/draarivpatel-ui/guardprompt.git"
+  },
+  "homepage": "https://github.com/draarivpatel-ui/guardprompt#readme",
+  "bugs": {
+    "url": "https://github.com/draarivpatel-ui/guardprompt/issues"
+  },
+  "type": "module",
+  "main": "./cjs/index.cjs",
+  "module": "./src/index.mjs",
+  "types": "./types/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./types/index.d.ts",
+      "import": "./src/index.mjs",
+      "require": "./cjs/index.cjs"
+    },
+    "./package.json": "./package.json"
+  },
+  "bin": {
+    "guardprompt": "bin/guardprompt.mjs"
+  },
+  "files": [
+    "src",
+    "cjs",
+    "types",
+    "bin",
+    "docs",
+    "README.md",
+    "SECURITY.md",
+    "CONTRIBUTING.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build:cjs": "node scripts/build-cjs.mjs",
+    "check:cjs": "node scripts/build-cjs.mjs --check",
+    "check:repo": "node scripts/check-repo.mjs",
+    "smoke": "node scripts/smoke.mjs",
+    "test": "node scripts/run-tests.mjs"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "keywords": [
+    "security",
+    "llm-security",
+    "prompt-injection",
+    "unicode-security",
+    "homoglyph",
+    "trojan-source",
+    "ai-agent",
+    "llm-firewall",
+    "owasp-llm01",
+    "cwe-1427",
+    "zero-dependency",
+    "node"
+  ],
+  "license": "MIT",
+  "sideEffects": false,
+  "dependencies": {},
+  "devDependencies": {}
+}

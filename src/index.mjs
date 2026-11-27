@@ -1,0 +1,1457 @@
+/*
+ * guardprompt core.
+ *
+ * Dependency-free deterministic inspection for untrusted text entering or
+ * leaving an LLM or agent system. The implementation uses bounded inputs,
+ * bounded recursion, bounded finding counts, and simple linear scans. It does
+ * not evaluate model behavior and it is not a substitute for least privilege,
+ * tool allowlists, or output authorization.
+ */
+
+export const VERSION = '1.0.0';
+
+export const CODE = Object.freeze({
+  INVALID_INPUT: 'ERR_GUARDPROMPT_INVALID_INPUT',
+  INVALID_OPTIONS: 'ERR_GUARDPROMPT_INVALID_OPTIONS',
+  INPUT_TOO_LARGE: 'ERR_GUARDPROMPT_INPUT_TOO_LARGE',
+  BLOCKED: 'ERR_GUARDPROMPT_BLOCKED'
+});
+
+export const DEFAULT_LIMITS = Object.freeze({
+  maxInputLength: 100000,
+  maxDecodedSize: 65536,
+  maxEncodedDepth: 3,
+  maxEncodedCandidates: 32,
+  maxFindings: 250
+});
+
+const HARD_LIMITS = Object.freeze({
+  maxInputLength: 1000000,
+  maxDecodedSize: 262144,
+  maxEncodedDepth: 5,
+  maxEncodedCandidates: 128,
+  maxFindings: 1000,
+  maxCanaryTokens: 64,
+  maxCanaryTokenLength: 1024,
+  maxAdditionalPhrases: 128,
+  maxAdditionalPhraseLength: 256,
+  maxTrustedImageHosts: 128
+});
+
+const CWE_PROMPT_INJECTION = 'CWE-1427';
+const CWE_ENCODING = 'CWE-116';
+const CWE_EXPOSURE = 'CWE-200';
+const OWASP_PROMPT_INJECTION = 'LLM01:2025';
+const OWASP_SENSITIVE_DISCLOSURE = 'LLM02:2025';
+
+export const RULES = Object.freeze({
+  'GP-CORE-LIMIT-001': Object.freeze({ layer: 'core', severity: 'medium', cwe: CWE_PROMPT_INJECTION, owasp: OWASP_PROMPT_INJECTION }),
+  'GP-UNI-TAG-001': Object.freeze({ layer: 'unicode', severity: 'critical', cwe: CWE_PROMPT_INJECTION, owasp: OWASP_PROMPT_INJECTION }),
+  'GP-UNI-BIDI-001': Object.freeze({ layer: 'unicode', severity: 'high', cwe: CWE_PROMPT_INJECTION, owasp: OWASP_PROMPT_INJECTION }),
+  'GP-UNI-ZW-001': Object.freeze({ layer: 'unicode', severity: 'medium', cwe: CWE_PROMPT_INJECTION, owasp: OWASP_PROMPT_INJECTION }),
+  'GP-UNI-VS-001': Object.freeze({ layer: 'unicode', severity: 'medium', cwe: CWE_PROMPT_INJECTION, owasp: OWASP_PROMPT_INJECTION }),
+  'GP-UNI-CTRL-001': Object.freeze({ layer: 'unicode', severity: 'medium', cwe: CWE_PROMPT_INJECTION, owasp: OWASP_PROMPT_INJECTION }),
+  'GP-UNI-CONFUSE-001': Object.freeze({ layer: 'unicode', severity: 'high', cwe: CWE_PROMPT_INJECTION, owasp: OWASP_PROMPT_INJECTION }),
+  'GP-UNI-MIXED-001': Object.freeze({ layer: 'unicode', severity: 'medium', cwe: CWE_PROMPT_INJECTION, owasp: OWASP_PROMPT_INJECTION }),
+  'GP-INJ-ROLE-001': Object.freeze({ layer: 'injection', severity: 'high', cwe: CWE_PROMPT_INJECTION, owasp: OWASP_PROMPT_INJECTION }),
+  'GP-INJ-TOKEN-001': Object.freeze({ layer: 'injection', severity: 'critical', cwe: CWE_PROMPT_INJECTION, owasp: OWASP_PROMPT_INJECTION }),
+  'GP-INJ-XML-001': Object.freeze({ layer: 'injection', severity: 'high', cwe: CWE_PROMPT_INJECTION, owasp: OWASP_PROMPT_INJECTION }),
+  'GP-INJ-OVERRIDE-001': Object.freeze({ layer: 'injection', severity: 'high', cwe: CWE_PROMPT_INJECTION, owasp: OWASP_PROMPT_INJECTION }),
+  'GP-INJ-PROMPT-001': Object.freeze({ layer: 'injection', severity: 'critical', cwe: CWE_PROMPT_INJECTION, owasp: OWASP_PROMPT_INJECTION }),
+  'GP-INJ-PERSONA-001': Object.freeze({ layer: 'injection', severity: 'medium', cwe: CWE_PROMPT_INJECTION, owasp: OWASP_PROMPT_INJECTION }),
+  'GP-INJ-INDIRECT-001': Object.freeze({ layer: 'injection', severity: 'high', cwe: CWE_PROMPT_INJECTION, owasp: OWASP_PROMPT_INJECTION }),
+  'GP-INJ-DELIM-001': Object.freeze({ layer: 'injection', severity: 'high', cwe: CWE_PROMPT_INJECTION, owasp: OWASP_PROMPT_INJECTION }),
+  'GP-INJ-TOOL-001': Object.freeze({ layer: 'injection', severity: 'critical', cwe: CWE_PROMPT_INJECTION, owasp: OWASP_PROMPT_INJECTION }),
+  'GP-INJ-STRUCT-001': Object.freeze({ layer: 'injection', severity: 'critical', cwe: CWE_PROMPT_INJECTION, owasp: OWASP_PROMPT_INJECTION }),
+  'GP-INJ-CUSTOM-001': Object.freeze({ layer: 'injection', severity: 'medium', cwe: CWE_PROMPT_INJECTION, owasp: OWASP_PROMPT_INJECTION }),
+  'GP-ENC-B64-001': Object.freeze({ layer: 'encoding', severity: 'medium', cwe: CWE_ENCODING, owasp: OWASP_PROMPT_INJECTION }),
+  'GP-ENC-HEX-001': Object.freeze({ layer: 'encoding', severity: 'medium', cwe: CWE_ENCODING, owasp: OWASP_PROMPT_INJECTION }),
+  'GP-ENC-URL-001': Object.freeze({ layer: 'encoding', severity: 'medium', cwe: CWE_ENCODING, owasp: OWASP_PROMPT_INJECTION }),
+  'GP-ENC-ROT13-001': Object.freeze({ layer: 'encoding', severity: 'high', cwe: CWE_ENCODING, owasp: OWASP_PROMPT_INJECTION }),
+  'GP-ENC-NEST-001': Object.freeze({ layer: 'encoding', severity: 'high', cwe: CWE_PROMPT_INJECTION, owasp: OWASP_PROMPT_INJECTION }),
+  'GP-ENC-LIMIT-001': Object.freeze({ layer: 'encoding', severity: 'medium', cwe: CWE_ENCODING, owasp: OWASP_PROMPT_INJECTION }),
+  'GP-EGR-CANARY-001': Object.freeze({ layer: 'egress', severity: 'critical', cwe: CWE_EXPOSURE, owasp: OWASP_SENSITIVE_DISCLOSURE }),
+  'GP-EGR-MARKDOWN-IMG-001': Object.freeze({ layer: 'egress', severity: 'high', cwe: CWE_EXPOSURE, owasp: OWASP_SENSITIVE_DISCLOSURE }),
+  'GP-EGR-DATAURL-001': Object.freeze({ layer: 'egress', severity: 'high', cwe: CWE_EXPOSURE, owasp: OWASP_SENSITIVE_DISCLOSURE }),
+  'GP-EGR-CREDENTIAL-001': Object.freeze({ layer: 'egress', severity: 'critical', cwe: CWE_EXPOSURE, owasp: OWASP_SENSITIVE_DISCLOSURE }),
+  'GP-EGR-PRIVATEKEY-001': Object.freeze({ layer: 'egress', severity: 'critical', cwe: CWE_EXPOSURE, owasp: OWASP_SENSITIVE_DISCLOSURE }),
+  'GP-EGR-PII-001': Object.freeze({ layer: 'egress', severity: 'high', cwe: CWE_EXPOSURE, owasp: OWASP_SENSITIVE_DISCLOSURE }),
+  'GP-EGR-URL-EXFIL-001': Object.freeze({ layer: 'egress', severity: 'high', cwe: CWE_EXPOSURE, owasp: OWASP_SENSITIVE_DISCLOSURE }),
+  'GP-EGR-HIGHENTROPY-001': Object.freeze({ layer: 'egress', severity: 'medium', cwe: CWE_EXPOSURE, owasp: OWASP_SENSITIVE_DISCLOSURE })
+});
+
+const SEVERITY_WEIGHT = Object.freeze({ low: 5, medium: 12, high: 25, critical: 40 });
+const SEVERITY_ORDER = Object.freeze({ low: 1, medium: 2, high: 3, critical: 4 });
+const OPTION_KEYS = new Set([
+  'maxInputLength',
+  'maxDecodedSize',
+  'maxEncodedDepth',
+  'maxEncodedCandidates',
+  'maxFindings',
+  'redactionToken',
+  'warnThreshold',
+  'blockThreshold',
+  'decodeEncoded',
+  'scanEncoded',
+  'normalizeUnicode',
+  'canaryTokens',
+  'additionalPhrases',
+  'trustedImageHosts',
+  'includeCanonical'
+]);
+
+export class GuardPromptError extends Error {
+  constructor(code, reason, input, findings, cause) {
+    super(code + ': ' + reason);
+    this.name = 'GuardPromptError';
+    this.code = code;
+    this.reason = reason;
+    if (input !== undefined) this.input = input;
+    if (findings !== undefined) this.findings = findings;
+    if (cause !== undefined) this.cause = cause;
+  }
+
+  toJSON() {
+    const output = {
+      name: this.name,
+      code: this.code,
+      reason: this.reason
+    };
+    if (this.input !== undefined) output.input = this.input;
+    if (this.findings !== undefined) output.findings = this.findings;
+    return output;
+  }
+}
+
+function throwError(code, reason, input, findings, cause) {
+  throw new GuardPromptError(code, reason, input, findings, cause);
+}
+
+function optionsError(reason, input) {
+  throwError(CODE.INVALID_OPTIONS, reason, input);
+}
+
+function isPlainObject(value) {
+  if (value === null || typeof value !== 'object') return false;
+  const proto = Object.getPrototypeOf(value);
+  return proto === Object.prototype || proto === null;
+}
+
+function boundedInteger(options, key, minimum, maximum) {
+  const value = options[key];
+  if (!Number.isSafeInteger(value) || value < minimum || value > maximum) {
+    optionsError(key + ' must be an integer between ' + minimum + ' and ' + maximum, value);
+  }
+  return value;
+}
+
+function stringArrayOption(value, key, maximumItems, maximumLength) {
+  if (!Array.isArray(value)) optionsError(key + ' must be an array of strings', value);
+  if (value.length > maximumItems) optionsError(key + ' has too many entries', value.length);
+  const output = [];
+  const seen = new Set();
+  for (const item of value) {
+    if (typeof item !== 'string') optionsError(key + ' entries must be strings', item);
+    if (item.length === 0 || item.length > maximumLength) {
+      optionsError(key + ' entries must have length 1 to ' + maximumLength, item.length);
+    }
+    if (!seen.has(item)) {
+      seen.add(item);
+      output.push(item);
+    }
+  }
+  return output;
+}
+
+export function normalizeOptions(options) {
+  if (options === undefined || options === null) options = {};
+  if (!isPlainObject(options)) optionsError('options must be a plain object', options);
+  for (const key of Object.keys(options)) {
+    if (!OPTION_KEYS.has(key)) optionsError('unknown option: ' + key, key);
+  }
+
+  const merged = {
+    maxInputLength: DEFAULT_LIMITS.maxInputLength,
+    maxDecodedSize: DEFAULT_LIMITS.maxDecodedSize,
+    maxEncodedDepth: DEFAULT_LIMITS.maxEncodedDepth,
+    maxEncodedCandidates: DEFAULT_LIMITS.maxEncodedCandidates,
+    maxFindings: DEFAULT_LIMITS.maxFindings,
+    redactionToken: '[redacted]',
+    warnThreshold: 12,
+    blockThreshold: 70,
+    decodeEncoded: true,
+    scanEncoded: true,
+    normalizeUnicode: true,
+    canaryTokens: [],
+    additionalPhrases: [],
+    trustedImageHosts: [],
+    includeCanonical: true,
+    ...options
+  };
+
+  merged.maxInputLength = boundedInteger(merged, 'maxInputLength', 128, HARD_LIMITS.maxInputLength);
+  merged.maxDecodedSize = boundedInteger(merged, 'maxDecodedSize', 256, HARD_LIMITS.maxDecodedSize);
+  merged.maxEncodedDepth = boundedInteger(merged, 'maxEncodedDepth', 0, HARD_LIMITS.maxEncodedDepth);
+  merged.maxEncodedCandidates = boundedInteger(merged, 'maxEncodedCandidates', 1, HARD_LIMITS.maxEncodedCandidates);
+  merged.maxFindings = boundedInteger(merged, 'maxFindings', 16, HARD_LIMITS.maxFindings);
+
+  if (typeof merged.redactionToken !== 'string' || merged.redactionToken.length === 0 || merged.redactionToken.length > 80 || /[\r\n]/.test(merged.redactionToken)) {
+    optionsError('redactionToken must be a single-line string of length 1 to 80', merged.redactionToken);
+  }
+  if (!Number.isSafeInteger(merged.warnThreshold) || merged.warnThreshold < 0 || merged.warnThreshold > 100) {
+    optionsError('warnThreshold must be an integer between 0 and 100', merged.warnThreshold);
+  }
+  if (!Number.isSafeInteger(merged.blockThreshold) || merged.blockThreshold < 1 || merged.blockThreshold > 100) {
+    optionsError('blockThreshold must be an integer between 1 and 100', merged.blockThreshold);
+  }
+  if (merged.warnThreshold > merged.blockThreshold) {
+    optionsError('warnThreshold must not exceed blockThreshold', { warnThreshold: merged.warnThreshold, blockThreshold: merged.blockThreshold });
+  }
+  for (const key of ['decodeEncoded', 'scanEncoded', 'normalizeUnicode', 'includeCanonical']) {
+    if (typeof merged[key] !== 'boolean') optionsError(key + ' must be a boolean', merged[key]);
+  }
+  merged.canaryTokens = stringArrayOption(merged.canaryTokens, 'canaryTokens', HARD_LIMITS.maxCanaryTokens, HARD_LIMITS.maxCanaryTokenLength);
+  merged.additionalPhrases = stringArrayOption(merged.additionalPhrases, 'additionalPhrases', HARD_LIMITS.maxAdditionalPhrases, HARD_LIMITS.maxAdditionalPhraseLength);
+  const loweredTrustedHosts = stringArrayOption(merged.trustedImageHosts, 'trustedImageHosts', HARD_LIMITS.maxTrustedImageHosts, 253).map((host) => host.toLowerCase());
+  merged.trustedImageHosts = Array.from(new Set(loweredTrustedHosts));
+  return Object.freeze(merged);
+}
+
+function assertBoundedString(input, options, noun) {
+  if (typeof input !== 'string') {
+    throwError(CODE.INVALID_INPUT, noun + ' must be a string', typeof input);
+  }
+  if (input.length > options.maxInputLength) {
+    throwError(CODE.INPUT_TOO_LARGE, noun + ' length ' + input.length + ' exceeds maxInputLength ' + options.maxInputLength, input.length);
+  }
+}
+
+function hexCodePoint(cp) {
+  return 'U+' + cp.toString(16).toUpperCase().padStart(4, '0');
+}
+
+function isTagChar(cp) {
+  return cp >= 0xE0000 && cp <= 0xE007F;
+}
+
+function isPrintableTagChar(cp) {
+  return cp >= 0xE0020 && cp <= 0xE007E;
+}
+
+function isBidiControl(cp) {
+  return (cp >= 0x202A && cp <= 0x202E) || (cp >= 0x2066 && cp <= 0x2069);
+}
+
+function isZeroWidth(cp) {
+  return cp === 0x180E || cp === 0x200B || cp === 0x200C || cp === 0x200D || cp === 0x200E || cp === 0x200F || cp === 0x2060 || cp === 0x2061 || cp === 0x2062 || cp === 0x2063 || cp === 0x2064 || cp === 0xFEFF;
+}
+
+function isVariationSelector(cp) {
+  return (cp >= 0xFE00 && cp <= 0xFE0F) || (cp >= 0xE0100 && cp <= 0xE01EF);
+}
+
+function isRestrictedControl(cp) {
+  return (cp >= 0x0000 && cp <= 0x0008) || cp === 0x000B || cp === 0x000C || (cp >= 0x000E && cp <= 0x001F) || (cp >= 0x007F && cp <= 0x009F);
+}
+
+function isInvisibleOrRestricted(cp) {
+  return isTagChar(cp) || isBidiControl(cp) || isZeroWidth(cp) || isVariationSelector(cp) || isRestrictedControl(cp);
+}
+
+function cleanEvidence(value, maximum) {
+  const max = maximum || 160;
+  let output = '';
+  for (const ch of String(value)) {
+    const cp = ch.codePointAt(0);
+    if (cp === 9 || cp === 10 || cp === 13) {
+      output += ' ';
+    } else if (isInvisibleOrRestricted(cp)) {
+      output += '<' + hexCodePoint(cp) + '>';
+    } else {
+      output += ch;
+    }
+    if (output.length >= max) break;
+  }
+  output = output.replace(/[ \t]+/g, ' ').trim();
+  if (output.length > max) output = output.slice(0, max - 1) + '~';
+  return output;
+}
+
+function makeFinding(id, description, evidence, start, end, extra) {
+  const meta = RULES[id];
+  if (!meta) throw new Error('unknown rule id: ' + id);
+  const finding = {
+    id,
+    layer: meta.layer,
+    severity: meta.severity,
+    cwe: meta.cwe,
+    owasp: meta.owasp,
+    description,
+    evidence: cleanEvidence(evidence),
+    start: typeof start === 'number' ? start : -1,
+    end: typeof end === 'number' ? end : -1
+  };
+  if (extra && typeof extra === 'object') {
+    for (const [key, value] of Object.entries(extra)) {
+      if (value !== undefined) finding[key] = value;
+    }
+  }
+  return Object.freeze(finding);
+}
+
+function pushCapped(findings, finding, cap) {
+  const limit = cap || 8;
+  let count = 0;
+  for (const existing of findings) {
+    if (existing.id === finding.id) count += 1;
+  }
+  if (count < limit) findings.push(finding);
+}
+
+function findAllOccurrences(text, needle) {
+  const positions = [];
+  if (needle.length === 0) return positions;
+  let index = text.indexOf(needle);
+  while (index !== -1 && positions.length < 32) {
+    positions.push(index);
+    index = text.indexOf(needle, index + needle.length);
+  }
+  return positions;
+}
+
+const CONFUSABLE_MAP = Object.freeze({
+  '\u0430': 'a', '\u0410': 'A',
+  '\u0435': 'e', '\u0415': 'E',
+  '\u043E': 'o', '\u041E': 'O',
+  '\u0440': 'p', '\u0420': 'P',
+  '\u0441': 'c', '\u0421': 'C',
+  '\u0445': 'x', '\u0425': 'X',
+  '\u0443': 'y', '\u0423': 'Y',
+  '\u0456': 'i', '\u0406': 'I',
+  '\u0458': 'j', '\u0408': 'J',
+  '\u04BB': 'h', '\u04BA': 'H',
+  '\u0455': 's', '\u0405': 'S',
+  '\u03B1': 'a', '\u0391': 'A',
+  '\u03B5': 'e', '\u0395': 'E',
+  '\u03BF': 'o', '\u039F': 'O',
+  '\u03C1': 'p', '\u03A1': 'P',
+  '\u03BA': 'k', '\u039A': 'K',
+  '\u03C4': 't', '\u03A4': 'T',
+  '\u03BD': 'v', '\u039D': 'N',
+  '\u03BC': 'u', '\u039C': 'M',
+  '\u03B7': 'n', '\u0397': 'H',
+  '\u03B9': 'i', '\u0399': 'I',
+  '\u03C7': 'x', '\u03A7': 'X',
+  '\u0442': 't', '\u0422': 'T',
+  '\u043C': 'm', '\u041C': 'M',
+  '\u043D': 'h', '\u041D': 'H',
+  '\u0432': 'b', '\u0412': 'B'
+});
+
+function scriptOfCodePoint(cp) {
+  if ((cp >= 0x0041 && cp <= 0x005A) || (cp >= 0x0061 && cp <= 0x007A) || (cp >= 0x00C0 && cp <= 0x024F) || (cp >= 0x1E00 && cp <= 0x1EFF)) return 'Latin';
+  if ((cp >= 0x0370 && cp <= 0x03FF) || (cp >= 0x1F00 && cp <= 0x1FFF)) return 'Greek';
+  if ((cp >= 0x0400 && cp <= 0x052F) || (cp >= 0x2DE0 && cp <= 0x2DFF) || (cp >= 0xA640 && cp <= 0xA69F)) return 'Cyrillic';
+  if (cp >= 0x0590 && cp <= 0x05FF) return 'Hebrew';
+  if ((cp >= 0x0600 && cp <= 0x06FF) || (cp >= 0x0750 && cp <= 0x077F) || (cp >= 0x08A0 && cp <= 0x08FF)) return 'Arabic';
+  if (cp >= 0x0900 && cp <= 0x097F) return 'Devanagari';
+  if (cp >= 0x4E00 && cp <= 0x9FFF) return 'Han';
+  if (cp >= 0x3040 && cp <= 0x309F) return 'Hiragana';
+  if (cp >= 0x30A0 && cp <= 0x30FF) return 'Katakana';
+  if (cp >= 0xAC00 && cp <= 0xD7AF) return 'Hangul';
+  if (cp >= 0x0E00 && cp <= 0x0E7F) return 'Thai';
+  if (cp >= 0x0530 && cp <= 0x058F) return 'Armenian';
+  if (cp >= 0x10A0 && cp <= 0x10FF) return 'Georgian';
+  return null;
+}
+
+function isTokenCharacter(ch) {
+  const cp = ch.codePointAt(0);
+  return scriptOfCodePoint(cp) !== null || (cp >= 0x0030 && cp <= 0x0039) || ch === '_' || ch === '-' || ch === '\u2010';
+}
+
+function mixedScriptTokens(text) {
+  const suspicious = [];
+  let tokenStart = -1;
+  let token = '';
+  let scripts = new Set();
+
+  function flush(end) {
+    if (tokenStart === -1) return;
+    if (scripts.size > 1 && scripts.has('Latin') && token.length >= 2) {
+      suspicious.push({ token, start: tokenStart, end, scripts: Array.from(scripts).sort() });
+    }
+    tokenStart = -1;
+    token = '';
+    scripts = new Set();
+  }
+
+  let utf16Index = 0;
+  for (const ch of text) {
+    const cp = ch.codePointAt(0);
+    if (isTokenCharacter(ch)) {
+      if (tokenStart === -1) tokenStart = utf16Index;
+      token += ch;
+      const script = scriptOfCodePoint(cp);
+      if (script) scripts.add(script);
+    } else {
+      flush(utf16Index);
+    }
+    utf16Index += ch.length;
+  }
+  flush(utf16Index);
+  return suspicious.slice(0, 8);
+}
+
+function decodeTagRuns(input) {
+  const segments = [];
+  let current = '';
+  let start = -1;
+  let count = 0;
+  let first = -1;
+  let utf16Index = 0;
+
+  function flush(end) {
+    if (current.length > 0) {
+      segments.push({ text: current, start, end, length: current.length });
+    }
+    current = '';
+    start = -1;
+  }
+
+  for (const ch of input) {
+    const cp = ch.codePointAt(0);
+    if (isTagChar(cp)) {
+      count += 1;
+      if (first === -1) first = utf16Index;
+      if (isPrintableTagChar(cp)) {
+        if (start === -1) start = utf16Index;
+        current += String.fromCharCode(cp - 0xE0000);
+      } else {
+        flush(utf16Index);
+      }
+    } else {
+      flush(utf16Index);
+    }
+    utf16Index += ch.length;
+  }
+  flush(utf16Index);
+  return { segments, count, first };
+}
+
+export function scanUnicode(input, options) {
+  const opts = normalizeOptions(options);
+  assertBoundedString(input, opts, 'input');
+
+  const counts = { tags: 0, bidi: 0, zeroWidth: 0, variationSelectors: 0, controls: 0, confusables: 0 };
+  const firstPositions = { tags: -1, bidi: -1, zeroWidth: -1, variationSelectors: -1, controls: -1, confusables: -1 };
+  const confusableExamples = [];
+  const tagData = decodeTagRuns(input);
+  counts.tags = tagData.count;
+  firstPositions.tags = tagData.first;
+
+  let utf16Index = 0;
+  for (const ch of input) {
+    const cp = ch.codePointAt(0);
+    if (isBidiControl(cp)) {
+      counts.bidi += 1;
+      if (firstPositions.bidi === -1) firstPositions.bidi = utf16Index;
+    }
+    if (isZeroWidth(cp)) {
+      counts.zeroWidth += 1;
+      if (firstPositions.zeroWidth === -1) firstPositions.zeroWidth = utf16Index;
+    }
+    if (isVariationSelector(cp)) {
+      counts.variationSelectors += 1;
+      if (firstPositions.variationSelectors === -1) firstPositions.variationSelectors = utf16Index;
+    }
+    if (isRestrictedControl(cp)) {
+      counts.controls += 1;
+      if (firstPositions.controls === -1) firstPositions.controls = utf16Index;
+    }
+    utf16Index += ch.length;
+  }
+
+  const normalized = opts.normalizeUnicode ? input.normalize('NFKC') : input;
+  let canonical = '';
+  utf16Index = 0;
+  for (const ch of normalized) {
+    const cp = ch.codePointAt(0);
+    if (isTagChar(cp) || isBidiControl(cp) || isZeroWidth(cp) || isVariationSelector(cp) || isRestrictedControl(cp)) {
+      utf16Index += ch.length;
+      continue;
+    }
+    const replacement = CONFUSABLE_MAP[ch];
+    if (replacement !== undefined) {
+      counts.confusables += 1;
+      if (firstPositions.confusables === -1) firstPositions.confusables = utf16Index;
+      if (confusableExamples.length < 8) confusableExamples.push(hexCodePoint(cp) + '->' + replacement);
+      canonical += replacement;
+    } else {
+      canonical += ch;
+    }
+    utf16Index += ch.length;
+  }
+
+  const findings = [];
+  if (counts.tags > 0) {
+    const decodedPreview = tagData.segments.map((segment) => segment.text).join(' ').trim();
+    findings.push(makeFinding(
+      'GP-UNI-TAG-001',
+      'Unicode Tag characters encode a covert instruction channel',
+      decodedPreview ? counts.tags + ' tag characters decode to: ' + decodedPreview : counts.tags + ' non-printing tag characters',
+      firstPositions.tags,
+      firstPositions.tags + 1,
+      { count: counts.tags, decoded: decodedPreview || undefined }
+    ));
+  }
+  if (counts.bidi > 0) {
+    findings.push(makeFinding('GP-UNI-BIDI-001', 'Bidirectional override or isolate control can reorder visible text', counts.bidi + ' bidi control characters', firstPositions.bidi, firstPositions.bidi + 1, { count: counts.bidi }));
+  }
+  if (counts.zeroWidth > 0) {
+    findings.push(makeFinding('GP-UNI-ZW-001', 'Zero-width characters can hide steganographic payload separators', counts.zeroWidth + ' zero-width characters', firstPositions.zeroWidth, firstPositions.zeroWidth + 1, { count: counts.zeroWidth }));
+  }
+  if (counts.variationSelectors > 0) {
+    findings.push(makeFinding('GP-UNI-VS-001', 'Variation selectors can carry a hidden byte channel', counts.variationSelectors + ' variation selectors', firstPositions.variationSelectors, firstPositions.variationSelectors + 1, { count: counts.variationSelectors }));
+  }
+  if (counts.controls > 0) {
+    findings.push(makeFinding('GP-UNI-CTRL-001', 'Restricted control characters can alter prompt framing or terminal display', counts.controls + ' restricted control characters', firstPositions.controls, firstPositions.controls + 1, { count: counts.controls }));
+  }
+  if (counts.confusables > 0) {
+    findings.push(makeFinding('GP-UNI-CONFUSE-001', 'Mixed-script confusable characters were canonicalized to their Latin lookalikes', confusableExamples.join(', '), firstPositions.confusables, firstPositions.confusables + 1, { count: counts.confusables }));
+  }
+  for (const item of mixedScriptTokens(canonical)) {
+    pushCapped(findings, makeFinding('GP-UNI-MIXED-001', 'A single token mixes scripts, a common homoglyph spoofing signal', item.token + ' uses ' + item.scripts.join(' and '), item.start, item.end, { scripts: item.scripts }), 4);
+  }
+
+  return Object.freeze({
+    canonical,
+    findings: Object.freeze(findings),
+    hiddenSegments: Object.freeze(tagData.segments.map((segment) => Object.freeze(segment))),
+    stats: Object.freeze({ ...counts, inputLength: input.length, canonicalLength: canonical.length })
+  });
+}
+
+const EXACT_PATTERNS = Object.freeze([
+  { needle: '<|im_start|>', id: 'GP-INJ-TOKEN-001', description: 'Chat template start control token' },
+  { needle: '<|im_end|>', id: 'GP-INJ-TOKEN-001', description: 'Chat template end control token' },
+  { needle: '<|endoftext|>', id: 'GP-INJ-TOKEN-001', description: 'Model end-of-text control token' },
+  { needle: '<|system|>', id: 'GP-INJ-TOKEN-001', description: 'Model system-role control token' },
+  { needle: '<|assistant|>', id: 'GP-INJ-TOKEN-001', description: 'Model assistant-role control token' },
+  { needle: '<|user|>', id: 'GP-INJ-TOKEN-001', description: 'Model user-role control token' },
+  { needle: '<|endofprompt|>', id: 'GP-INJ-TOKEN-001', description: 'Prompt boundary control token' },
+  { needle: '[inst]', id: 'GP-INJ-TOKEN-001', description: 'Instruction template delimiter' },
+  { needle: '[/inst]', id: 'GP-INJ-TOKEN-001', description: 'Instruction template closing delimiter' },
+  { needle: '<<sys>>', id: 'GP-INJ-TOKEN-001', description: 'System template delimiter' },
+  { needle: '<</sys>>', id: 'GP-INJ-TOKEN-001', description: 'System template closing delimiter' },
+  { needle: '[system]', id: 'GP-INJ-TOKEN-001', description: 'Serialized system-role delimiter' },
+  { needle: '[assistant]', id: 'GP-INJ-TOKEN-001', description: 'Serialized assistant-role delimiter' },
+  { needle: '<system>', id: 'GP-INJ-XML-001', description: 'XML-style system prompt tag' },
+  { needle: '</system>', id: 'GP-INJ-XML-001', description: 'XML-style system prompt closing tag' },
+  { needle: '<assistant>', id: 'GP-INJ-XML-001', description: 'XML-style assistant transcript tag' },
+  { needle: '</assistant>', id: 'GP-INJ-XML-001', description: 'XML-style assistant transcript closing tag' },
+  { needle: '<user>', id: 'GP-INJ-XML-001', description: 'XML-style user transcript tag' },
+  { needle: '</user>', id: 'GP-INJ-XML-001', description: 'XML-style user transcript closing tag' },
+  { needle: '<instruction>', id: 'GP-INJ-XML-001', description: 'XML-style instruction tag' },
+  { needle: '</instruction>', id: 'GP-INJ-XML-001', description: 'XML-style instruction closing tag' },
+  { needle: '<system_prompt>', id: 'GP-INJ-XML-001', description: 'XML-style system prompt tag' },
+  { needle: '</system_prompt>', id: 'GP-INJ-XML-001', description: 'XML-style system prompt closing tag' },
+  { needle: '<tool_call>', id: 'GP-INJ-TOOL-001', description: 'Forged XML tool-call tag' },
+  { needle: '</tool_call>', id: 'GP-INJ-TOOL-001', description: 'Forged XML tool-call closing tag' },
+  { needle: '<function_call>', id: 'GP-INJ-TOOL-001', description: 'Forged XML function-call tag' },
+  { needle: '</function_call>', id: 'GP-INJ-TOOL-001', description: 'Forged XML function-call closing tag' },
+  { needle: '<tool_response>', id: 'GP-INJ-TOOL-001', description: 'Forged XML tool-response tag' },
+  { needle: '</tool_response>', id: 'GP-INJ-TOOL-001', description: 'Forged XML tool-response closing tag' },
+  { needle: '"tool_calls"', id: 'GP-INJ-TOOL-001', description: 'Serialized tool_calls key' },
+  { needle: "'tool_calls'", id: 'GP-INJ-TOOL-001', description: 'Serialized tool_calls key' },
+  { needle: '"function_call"', id: 'GP-INJ-TOOL-001', description: 'Serialized function_call key' },
+  { needle: 'tool_call:', id: 'GP-INJ-TOOL-001', description: 'Serialized tool-call field' },
+  { needle: 'function_call:', id: 'GP-INJ-TOOL-001', description: 'Serialized function-call field' },
+  { needle: 'call_tool(', id: 'GP-INJ-TOOL-001', description: 'Inline tool invocation syntax' },
+  { needle: 'use_tool(', id: 'GP-INJ-TOOL-001', description: 'Inline tool invocation syntax' },
+  { needle: 'run_tool(', id: 'GP-INJ-TOOL-001', description: 'Inline tool invocation syntax' },
+  { needle: 'execute_tool(', id: 'GP-INJ-TOOL-001', description: 'Inline tool invocation syntax' },
+  { needle: 'end of system prompt', id: 'GP-INJ-DELIM-001', description: 'Transcript boundary escape phrase' },
+  { needle: 'end of user input', id: 'GP-INJ-DELIM-001', description: 'Transcript boundary escape phrase' },
+  { needle: 'end user input', id: 'GP-INJ-DELIM-001', description: 'Transcript boundary escape phrase' },
+  { needle: 'system message resumes', id: 'GP-INJ-DELIM-001', description: 'Transcript boundary escape phrase' },
+  { needle: 'return to system instructions', id: 'GP-INJ-DELIM-001', description: 'Transcript boundary escape phrase' },
+  { needle: 'close user input', id: 'GP-INJ-DELIM-001', description: 'Transcript boundary escape phrase' },
+  { needle: 'begin system message', id: 'GP-INJ-DELIM-001', description: 'Transcript boundary spoofing phrase' },
+  { needle: 'new system message', id: 'GP-INJ-DELIM-001', description: 'Transcript boundary spoofing phrase' },
+  { needle: 'you are now', id: 'GP-INJ-PERSONA-001', description: 'Persona reset phrase' },
+  { needle: 'pretend you are', id: 'GP-INJ-PERSONA-001', description: 'Persona spoofing phrase' },
+  { needle: 'pretend to be', id: 'GP-INJ-PERSONA-001', description: 'Persona spoofing phrase' },
+  { needle: 'act as if you are', id: 'GP-INJ-PERSONA-001', description: 'Persona spoofing phrase' },
+  { needle: 'act as an unrestricted', id: 'GP-INJ-PERSONA-001', description: 'Unrestricted-persona jailbreak phrase' },
+  { needle: 'developer mode', id: 'GP-INJ-PERSONA-001', description: 'Developer-mode jailbreak phrase' },
+  { needle: 'dan mode', id: 'GP-INJ-PERSONA-001', description: 'Named jailbreak mode' },
+  { needle: 'do anything now', id: 'GP-INJ-PERSONA-001', description: 'Named jailbreak instruction' },
+  { needle: 'without restrictions', id: 'GP-INJ-PERSONA-001', description: 'Restriction removal phrase' },
+  { needle: 'ignore safety', id: 'GP-INJ-PERSONA-001', description: 'Safety bypass instruction' },
+  { needle: 'bypass safety', id: 'GP-INJ-PERSONA-001', description: 'Safety bypass instruction' },
+  { needle: 'when the assistant reads this', id: 'GP-INJ-INDIRECT-001', description: 'Indirect injection addressed to a downstream assistant' },
+  { needle: 'when an ai reads this', id: 'GP-INJ-INDIRECT-001', description: 'Indirect injection addressed to a downstream model' },
+  { needle: 'the assistant must', id: 'GP-INJ-INDIRECT-001', description: 'Instruction addressed to the assistant rather than the user' },
+  { needle: 'the ai must', id: 'GP-INJ-INDIRECT-001', description: 'Instruction addressed to the model rather than the user' },
+  { needle: 'assistant should follow', id: 'GP-INJ-INDIRECT-001', description: 'Indirect assistant instruction' },
+  { needle: 'follow these instructions instead', id: 'GP-INJ-INDIRECT-001', description: 'Instruction replacement phrase' },
+  { needle: 'instructions for the assistant', id: 'GP-INJ-INDIRECT-001', description: 'Indirect assistant instruction block' },
+  { needle: 'instructions to the assistant', id: 'GP-INJ-INDIRECT-001', description: 'Indirect assistant instruction block' },
+  { needle: 'dear assistant', id: 'GP-INJ-INDIRECT-001', description: 'Indirect assistant instruction block' },
+  { needle: 'attention assistant', id: 'GP-INJ-INDIRECT-001', description: 'Indirect assistant instruction block' },
+  { needle: 'if you are an ai', id: 'GP-INJ-INDIRECT-001', description: 'Model-directed conditional instruction' },
+  { needle: 'if you are a language model', id: 'GP-INJ-INDIRECT-001', description: 'Model-directed conditional instruction' },
+  { needle: 'as an ai assistant you must', id: 'GP-INJ-INDIRECT-001', description: 'Model-directed imperative' },
+  { needle: 'downstream model', id: 'GP-INJ-INDIRECT-001', description: 'Reference to a downstream model recipient' }
+]);
+
+const OVERRIDE_START_WORDS = Object.freeze(['ignore', 'disregard', 'forget', 'override', 'bypass']);
+const INSTRUCTION_TARGET_WORDS = Object.freeze(['instructions', 'directives', 'rules', 'system prompt', 'safety guidelines', 'constraints']);
+const PROMPT_EXFIL_VERBS = Object.freeze(['reveal', 'show', 'print', 'repeat', 'disclose', 'leak', 'output', 'expose', 'tell', 'display', 'dump']);
+const PROMPT_EXFIL_TARGETS = Object.freeze(['system prompt', 'hidden instructions', 'initial instructions', 'developer instructions', 'original instructions', 'system message', 'your instructions', 'the instructions']);
+
+function scanWindowedInstructionPatterns(lower, findings) {
+  for (const startWord of OVERRIDE_START_WORDS) {
+    for (const start of findAllOccurrences(lower, startWord)) {
+      const window = lower.slice(start, Math.min(lower.length, start + 140));
+      const target = INSTRUCTION_TARGET_WORDS.find((item) => window.includes(item));
+      if (target) {
+        const end = Math.min(lower.length, start + window.indexOf(target) + target.length);
+        pushCapped(findings, makeFinding('GP-INJ-OVERRIDE-001', 'Instruction-override phrase attempts to replace prior directives', lower.slice(start, end), start, end), 8);
+      }
+    }
+  }
+
+  for (const verb of PROMPT_EXFIL_VERBS) {
+    for (const start of findAllOccurrences(lower, verb)) {
+      const window = lower.slice(start, Math.min(lower.length, start + 130));
+      const target = PROMPT_EXFIL_TARGETS.find((item) => window.includes(item));
+      if (target) {
+        const end = Math.min(lower.length, start + window.indexOf(target) + target.length);
+        pushCapped(findings, makeFinding('GP-INJ-PROMPT-001', 'Request attempts to expose hidden or system instructions', lower.slice(start, end), start, end), 8);
+      }
+    }
+  }
+}
+
+const ROLE_LINE_RE = /^[\t ]{0,12}(system|assistant|user|developer|tool|human|ai)[\t ]*:[\t ]*\S/i;
+const HEADING_RE = /^[\t ]{0,6}#{1,6}[\t ]+(system|instructions|system prompt|developer message)\b/i;
+const FENCE_RE = /```[\t ]*(system|instructions|prompt|json)\b/gi;
+const DOUBLE_ROLE_RE = /"role"[\t ]*:[\t ]*"(system|assistant|user|tool)"/gi;
+const SINGLE_ROLE_RE = /'role'[\t ]*:[\t ]*'(system|assistant|user|tool)'/gi;
+const INVOKE_RE = /<\/?(?:tool_call|function_call|tool_response|invoke|function_results?)\b[^>]{0,200}>/gi;
+const JSON_TOOL_RE = /"(?:tool_calls|function_call)"[\t ]*:/gi;
+
+function scanRegexFindings(input, regex, id, description, findings, severityOverride) {
+  regex.lastIndex = 0;
+  let match = regex.exec(input);
+  let count = 0;
+  while (match !== null && count < 8) {
+    const start = match.index;
+    const end = start + match[0].length;
+    pushCapped(findings, makeFinding(id, description, match[0], start, end, severityOverride ? { severity: severityOverride } : undefined), 8);
+    count += 1;
+    if (match[0].length === 0) regex.lastIndex += 1;
+    match = regex.exec(input);
+  }
+}
+
+export function scanInjection(input, options) {
+  const opts = normalizeOptions(options);
+  assertBoundedString(input, opts, 'input');
+  const lower = input.toLowerCase();
+  const findings = [];
+
+  for (const pattern of EXACT_PATTERNS) {
+    for (const start of findAllOccurrences(lower, pattern.needle)) {
+      pushCapped(findings, makeFinding(pattern.id, pattern.description, input.slice(start, start + pattern.needle.length), start, start + pattern.needle.length), 8);
+    }
+  }
+
+  let offset = 0;
+  const lineParts = input.split(/(\r\n|\n|\r)/);
+  for (let partIndex = 0; partIndex < lineParts.length; partIndex += 2) {
+    const line = lineParts[partIndex];
+    const delimiter = lineParts[partIndex + 1] || '';
+    if (ROLE_LINE_RE.test(line)) {
+      const end = Math.min(input.length, offset + line.length);
+      pushCapped(findings, makeFinding('GP-INJ-ROLE-001', 'Line spoofs a chat-role boundary label', line, offset, end), 8);
+    }
+    if (HEADING_RE.test(line)) {
+      const end = Math.min(input.length, offset + line.length);
+      pushCapped(findings, makeFinding('GP-INJ-DELIM-001', 'Markdown heading imitates a system or instruction boundary', line, offset, end), 8);
+    }
+    offset += line.length + delimiter.length;
+  }
+
+  scanRegexFindings(input, FENCE_RE, 'GP-INJ-DELIM-001', 'Markdown code fence imitates a privileged prompt boundary', findings);
+  scanRegexFindings(input, DOUBLE_ROLE_RE, 'GP-INJ-STRUCT-001', 'Serialized message object assigns a privileged role', findings);
+  scanRegexFindings(input, SINGLE_ROLE_RE, 'GP-INJ-STRUCT-001', 'Serialized message object assigns a privileged role', findings);
+  scanRegexFindings(input, INVOKE_RE, 'GP-INJ-TOOL-001', 'XML-like tool invocation or response forgery', findings);
+  scanRegexFindings(input, JSON_TOOL_RE, 'GP-INJ-TOOL-001', 'Serialized tool invocation key forgery', findings);
+  scanWindowedInstructionPatterns(lower, findings);
+
+  for (const phrase of opts.additionalPhrases) {
+    const needle = phrase.toLowerCase();
+    for (const start of findAllOccurrences(lower, needle)) {
+      pushCapped(findings, makeFinding('GP-INJ-CUSTOM-001', 'Input matches a caller-supplied blocked phrase', input.slice(start, start + phrase.length), start, start + phrase.length), 8);
+    }
+  }
+
+  findings.sort((a, b) => (a.start - b.start) || a.id.localeCompare(b.id));
+  return Object.freeze(findings);
+}
+
+function isMostlyPrintable(text) {
+  if (text.length === 0) return false;
+  let bad = 0;
+  for (const ch of text) {
+    const cp = ch.codePointAt(0);
+    if ((cp < 32 && cp !== 9 && cp !== 10 && cp !== 13) || cp === 127 || isTagChar(cp)) bad += 1;
+  }
+  return bad / text.length <= 0.15;
+}
+
+function utf8Decode(bytes) {
+  try {
+    return new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+  } catch {
+    return null;
+  }
+}
+
+function decodeBase64Candidate(token, maxBytes) {
+  if (token.length < 20 || token.length > 2048 || token.length % 4 === 1) return null;
+  let padding = 0;
+  let alphabetSeen = false;
+  let upper = false;
+  let lower = false;
+  let digit = false;
+  let symbol = false;
+  for (let i = 0; i < token.length; i += 1) {
+    const ch = token[i];
+    if (ch >= 'A' && ch <= 'Z') upper = true;
+    else if (ch >= 'a' && ch <= 'z') lower = true;
+    else if (ch >= '0' && ch <= '9') digit = true;
+    else if (ch === '+' || ch === '/') symbol = true;
+    else if (ch === '=') {
+      padding += 1;
+      if (padding > 2 || i < token.length - 2) return null;
+    } else {
+      return null;
+    }
+    if (ch !== '=') alphabetSeen = true;
+  }
+  if (!alphabetSeen || !(digit || symbol || padding > 0 || (upper && lower))) return null;
+  let padded = token;
+  while (padded.length % 4 !== 0) padded += '=';
+  const bytes = Buffer.from(padded, 'base64');
+  if (bytes.length === 0 || bytes.length > maxBytes) return null;
+  const canonical = bytes.toString('base64').replace(/=+$/u, '');
+  if (canonical !== token.replace(/=+$/u, '')) return null;
+  const text = utf8Decode(bytes);
+  if (text === null || !isMostlyPrintable(text)) return null;
+  return text;
+}
+
+function decodeHexCandidate(token, maxBytes) {
+  if (token.length < 20 || token.length > 2048 || token.length % 2 !== 0) return null;
+  for (const ch of token) {
+    if (!((ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f') || (ch >= 'A' && ch <= 'F'))) return null;
+  }
+  const bytes = Buffer.from(token, 'hex');
+  if (bytes.length === 0 || bytes.length > maxBytes) return null;
+  const text = utf8Decode(bytes);
+  if (text === null || !isMostlyPrintable(text)) return null;
+  return text;
+}
+
+function isHexDigit(ch) {
+  return (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f') || (ch >= 'A' && ch <= 'F');
+}
+
+function hexValue(ch) {
+  if (ch >= '0' && ch <= '9') return ch.charCodeAt(0) - 48;
+  if (ch >= 'a' && ch <= 'f') return ch.charCodeAt(0) - 87;
+  return ch.charCodeAt(0) - 55;
+}
+
+function percentDecodeCandidate(token, maxBytes) {
+  if (token.length < 6 || token.length > 2048) return null;
+  let encodedCount = 0;
+  const bytes = [];
+  for (let i = 0; i < token.length; i += 1) {
+    const ch = token[i];
+    if (ch === '%') {
+      if (i + 2 >= token.length || !isHexDigit(token[i + 1]) || !isHexDigit(token[i + 2])) return null;
+      bytes.push(hexValue(token[i + 1]) * 16 + hexValue(token[i + 2]));
+      encodedCount += 1;
+      i += 2;
+    } else if (ch === '+') {
+      bytes.push(32);
+    } else {
+      const cp = ch.codePointAt(0);
+      if (cp > 127) return null;
+      bytes.push(cp);
+    }
+    if (bytes.length > maxBytes) return null;
+  }
+  if (encodedCount < 2) return null;
+  const text = utf8Decode(Uint8Array.from(bytes));
+  if (text === null || !isMostlyPrintable(text)) return null;
+  return text;
+}
+
+function isTokenDelimiter(ch) {
+  return ch === undefined || /\s/u.test(ch) || ch === '"' || ch === "'" || ch === '`' || ch === '<' || ch === '>' || ch === '(' || ch === ')' || ch === '[' || ch === ']' || ch === '{' || ch === '}' || ch === ',';
+}
+
+function countPercentHexSequences(token) {
+  let count = 0;
+  for (let i = 0; i + 2 < token.length; i += 1) {
+    if (token[i] === '%' && isHexDigit(token[i + 1]) && isHexDigit(token[i + 2])) count += 1;
+  }
+  return count;
+}
+
+function encodedValueCharacter(ch) {
+  if (ch === undefined) return false;
+  const cp = ch.codePointAt(0);
+  return (cp >= 48 && cp <= 57) || (cp >= 65 && cp <= 90) || (cp >= 97 && cp <= 122) || ch === '+' || ch === '/' || ch === '%' || ch === '-' || ch === '.' || ch === '_' || ch === '~' || ch === '=';
+}
+
+function pushEncodedCandidate(tokens, seen, type, token, start, end) {
+  if (!token || token.length > 2048) return;
+  const key = start + ':' + end + ':' + type;
+  if (seen.has(key)) return;
+  seen.add(key);
+  if (type === 'url') {
+    tokens.push({ type, token, start, end });
+  } else if (token.length >= 20) {
+    tokens.push({ type, token, start, end });
+  }
+}
+
+function addEmbeddedEncodedCandidates(tokens, seen, outerToken, outerStart) {
+  for (let index = 0; index < outerToken.length; index += 1) {
+    if (outerToken[index] !== '=') continue;
+    let end = index + 1;
+    while (end < outerToken.length && encodedValueCharacter(outerToken[end])) end += 1;
+    const value = outerToken.slice(index + 1, end);
+    if (value.length < 6) continue;
+    const absoluteStart = outerStart + index + 1;
+    const absoluteEnd = outerStart + end;
+    if (countPercentHexSequences(value) >= 2) {
+      pushEncodedCandidate(tokens, seen, 'url', value, absoluteStart, absoluteEnd);
+    } else {
+      pushEncodedCandidate(tokens, seen, 'auto', value, absoluteStart, absoluteEnd);
+    }
+  }
+}
+
+function extractEncodedTokens(text) {
+  const tokens = [];
+  const seen = new Set();
+  let start = -1;
+  let token = '';
+
+  function flush(end) {
+    if (start !== -1 && token.length <= 2048) {
+      if (countPercentHexSequences(token) >= 2) {
+        pushEncodedCandidate(tokens, seen, 'url', token, start, end);
+      } else {
+        pushEncodedCandidate(tokens, seen, 'auto', token, start, end);
+      }
+      addEmbeddedEncodedCandidates(tokens, seen, token, start);
+    }
+    start = -1;
+    token = '';
+  }
+
+  for (let i = 0; i < text.length; i += 1) {
+    const ch = text[i];
+    const cp = ch.codePointAt(0);
+    if (cp <= 127 && !isTokenDelimiter(ch) && ch !== '=') {
+      if (start === -1) start = i;
+      token += ch;
+    } else if (cp <= 127 && ch === '=' && start !== -1) {
+      token += ch;
+    } else {
+      flush(i);
+    }
+  }
+  flush(text.length);
+  return tokens.slice(0, HARD_LIMITS.maxEncodedCandidates);
+}
+
+function rot13(text) {
+  let output = '';
+  for (const ch of text) {
+    const cp = ch.codePointAt(0);
+    if (cp >= 65 && cp <= 90) output += String.fromCharCode(((cp - 65 + 13) % 26) + 65);
+    else if (cp >= 97 && cp <= 122) output += String.fromCharCode(((cp - 97 + 13) % 26) + 97);
+    else output += ch;
+  }
+  return output;
+}
+
+function encodingRuleFor(type) {
+  if (type === 'base64') return 'GP-ENC-B64-001';
+  if (type === 'hex') return 'GP-ENC-HEX-001';
+  return 'GP-ENC-URL-001';
+}
+
+function addEncodedLimit(findings, reason, start, end) {
+  const already = findings.some((finding) => finding.id === 'GP-ENC-LIMIT-001');
+  if (!already) {
+    findings.push(makeFinding('GP-ENC-LIMIT-001', 'Encoded-payload inspection stopped at a deterministic safety limit', reason, start, end));
+  }
+}
+
+function cloneNestedFinding(finding, path, encoding) {
+  const copy = {
+    id: finding.id,
+    layer: finding.layer,
+    severity: finding.severity,
+    cwe: finding.cwe,
+    owasp: finding.owasp,
+    description: finding.description + ' inside decoded ' + encoding + ' payload',
+    evidence: finding.evidence,
+    start: -1,
+    end: -1,
+    path: path.slice(),
+    nestedRule: finding.id
+  };
+  return Object.freeze(copy);
+}
+
+function collectEncodedLayer(text, path, depth, state, opts, findings, payloads) {
+  if (depth >= opts.maxEncodedDepth) return;
+  const candidates = extractEncodedTokens(text);
+
+  for (const candidate of candidates) {
+    if (state.candidates >= opts.maxEncodedCandidates) {
+      addEncodedLimit(findings, 'candidate count limit reached', candidate.start, candidate.end);
+      return;
+    }
+    state.candidates += 1;
+
+    let decoded = null;
+    let type = null;
+    if (candidate.type === 'url') {
+      decoded = percentDecodeCandidate(candidate.token, opts.maxDecodedSize);
+      type = 'url';
+    } else {
+      decoded = decodeBase64Candidate(candidate.token, opts.maxDecodedSize);
+      type = 'base64';
+      if (decoded === null) {
+        decoded = decodeHexCandidate(candidate.token, opts.maxDecodedSize);
+        type = 'hex';
+      }
+    }
+    if (decoded === null || decoded.length === 0 || decoded === candidate.token) continue;
+
+    if (state.bytes + decoded.length > opts.maxDecodedSize) {
+      addEncodedLimit(findings, 'decoded byte budget exceeded', candidate.start, candidate.end);
+      return;
+    }
+    const key = type + ':' + decoded.length + ':' + decoded;
+    if (state.seen.has(key)) continue;
+    state.seen.add(key);
+    state.bytes += decoded.length;
+
+    const nextPath = path.concat(type);
+    payloads.push(Object.freeze({
+      encoding: type,
+      path: Object.freeze(nextPath.slice()),
+      depth: depth + 1,
+      start: candidate.start,
+      end: candidate.end,
+      length: decoded.length,
+      preview: cleanEvidence(decoded, 100)
+    }));
+    findings.push(makeFinding(
+      encodingRuleFor(type),
+      'Inspectable ' + type + ' encoded payload was decoded under configured limits',
+      'decoded length ' + decoded.length + ': ' + decoded,
+      candidate.start,
+      candidate.end,
+      { path: nextPath.slice(), decodedLength: decoded.length }
+    ));
+
+    const nested = scanInjection(decoded, opts);
+    if (nested.length > 0) {
+      findings.push(makeFinding(
+        'GP-ENC-NEST-001',
+        'Decoded payload contains prompt-injection content',
+        nested[0].id + ': ' + nested[0].evidence,
+        candidate.start,
+        candidate.end,
+        { path: nextPath.slice(), nestedRule: nested[0].id }
+      ));
+      for (const nestedFinding of nested.slice(0, 6)) {
+        findings.push(cloneNestedFinding(nestedFinding, nextPath, type));
+      }
+    }
+    collectEncodedLayer(decoded, nextPath, depth + 1, state, opts, findings, payloads);
+  }
+
+  if (text.length >= 8 && /[A-Za-z]/u.test(text)) {
+    const rotated = rot13(text);
+    const nested = scanInjection(rotated, opts);
+    if (nested.length > 0) {
+      const first = nested[0];
+      findings.push(makeFinding(
+        'GP-ENC-ROT13-001',
+        'ROT13-transformed text contains prompt-injection content',
+        first.id + ': ' + first.evidence,
+        Math.max(0, first.start),
+        Math.max(0, first.end),
+        { path: path.concat('rot13'), nestedRule: first.id }
+      ));
+      for (const nestedFinding of nested.slice(0, 4)) {
+        const copy = cloneNestedFinding(nestedFinding, path.concat('rot13'), 'rot13');
+        findings.push(copy);
+      }
+    }
+  }
+}
+
+export function scanEncoded(input, options) {
+  const opts = normalizeOptions(options);
+  assertBoundedString(input, opts, 'input');
+  const findings = [];
+  const payloads = [];
+  if (!opts.decodeEncoded || opts.maxEncodedDepth === 0) {
+    return Object.freeze({
+      findings: Object.freeze(findings),
+      payloads: Object.freeze(payloads),
+      stats: Object.freeze({ candidates: 0, decodedBytes: 0, depth: 0 })
+    });
+  }
+  const state = { bytes: 0, candidates: 0, seen: new Set() };
+  collectEncodedLayer(input, [], 0, state, opts, findings, payloads);
+  return Object.freeze({
+    findings: Object.freeze(findings),
+    payloads: Object.freeze(payloads),
+    stats: Object.freeze({ candidates: state.candidates, decodedBytes: state.bytes, depth: opts.maxEncodedDepth })
+  });
+}
+
+function mergeOverlappingSpans(spans) {
+  const sorted = spans.slice().sort((a, b) => (a.start - b.start) || (b.end - a.end));
+  const merged = [];
+  for (const span of sorted) {
+    const last = merged[merged.length - 1];
+    if (!last || span.start > last.end) {
+      merged.push({ start: span.start, end: span.end });
+    } else if (span.end > last.end) {
+      last.end = span.end;
+    }
+  }
+  return merged;
+}
+
+function redactCanonical(canonical, findings, redactionToken) {
+  const spans = [];
+  for (const finding of findings) {
+    if (finding.start >= 0 && finding.end > finding.start && SEVERITY_ORDER[finding.severity] >= SEVERITY_ORDER.medium) {
+      spans.push({ start: Math.min(finding.start, canonical.length), end: Math.min(finding.end, canonical.length) });
+    }
+  }
+  if (spans.length === 0) return canonical;
+  const merged = mergeOverlappingSpans(spans);
+  let output = '';
+  let cursor = 0;
+  for (const span of merged) {
+    output += canonical.slice(cursor, span.start);
+    output += redactionToken;
+    cursor = span.end;
+  }
+  output += canonical.slice(cursor);
+  return output;
+}
+
+function dedupeFindings(findings) {
+  const output = [];
+  const seen = new Set();
+  for (const finding of findings) {
+    const key = finding.id + '|' + finding.start + '|' + finding.end + '|' + finding.evidence + '|' + (finding.path ? finding.path.join('>') : '');
+    if (!seen.has(key)) {
+      seen.add(key);
+      output.push(finding);
+    }
+  }
+  return output;
+}
+
+function calculateRisk(findings) {
+  const firstSeen = new Set();
+  let score = 0;
+  for (const finding of findings) {
+    if (!firstSeen.has(finding.id)) {
+      firstSeen.add(finding.id);
+      score += SEVERITY_WEIGHT[finding.severity] || 0;
+    } else {
+      score += 2;
+    }
+  }
+  return Math.min(100, score);
+}
+
+function riskLevel(score) {
+  if (score === 0) return 'none';
+  if (score < 20) return 'low';
+  if (score < 50) return 'medium';
+  if (score < 80) return 'high';
+  return 'critical';
+}
+
+function actionFor(findings, score, opts) {
+  if (findings.some((finding) => finding.severity === 'critical')) return 'block';
+  if (score >= opts.blockThreshold) return 'block';
+  if (score >= opts.warnThreshold) return 'warn';
+  return 'allow';
+}
+
+function finalizeReport(kind, input, canonical, findings, opts, extra) {
+  const deduped = dedupeFindings(findings);
+  const truncated = deduped.length > opts.maxFindings;
+  const capped = truncated ? deduped.slice(0, opts.maxFindings) : deduped;
+  const riskScore = calculateRisk(capped);
+  const report = {
+    kind,
+    action: actionFor(capped, riskScore, opts),
+    riskScore,
+    riskLevel: riskLevel(riskScore),
+    inputLength: input.length,
+    canonicalLength: canonical.length,
+    findings: Object.freeze(capped),
+    findingCount: capped.length,
+    truncated,
+    redacted: redactCanonical(canonical, capped, opts.redactionToken),
+    canonical: opts.includeCanonical ? canonical : undefined,
+    stats: Object.freeze({
+      critical: capped.filter((finding) => finding.severity === 'critical').length,
+      high: capped.filter((finding) => finding.severity === 'high').length,
+      medium: capped.filter((finding) => finding.severity === 'medium').length,
+      low: capped.filter((finding) => finding.severity === 'low').length
+    })
+  };
+  if (extra && typeof extra === 'object') Object.assign(report, extra);
+  return Object.freeze(report);
+}
+
+export function inspectPrompt(input, options) {
+  const opts = normalizeOptions(options);
+  assertBoundedString(input, opts, 'input');
+  const unicode = scanUnicode(input, opts);
+  const findings = [];
+  findings.push(...unicode.findings);
+
+  for (const segment of unicode.hiddenSegments) {
+    const nested = scanInjection(segment.text, opts);
+    for (const nestedFinding of nested.slice(0, 8)) {
+      findings.push(cloneNestedFinding(nestedFinding, ['unicode-tags'], 'unicode tag channel'));
+    }
+  }
+
+  findings.push(...scanInjection(unicode.canonical, opts));
+  if (opts.scanEncoded) findings.push(...scanEncoded(unicode.canonical, opts).findings);
+
+  return finalizeReport('input', input, unicode.canonical, findings, opts, {
+    unicode: Object.freeze({ ...unicode.stats }),
+    hiddenSegmentCount: unicode.hiddenSegments.length
+  });
+}
+
+function hostIsTrusted(hostname, trustedImageHosts) {
+  const host = hostname.toLowerCase();
+  for (const trusted of trustedImageHosts) {
+    if (host === trusted || host.endsWith('.' + trusted)) return true;
+  }
+  return false;
+}
+
+function parseUrlSafely(value) {
+  try {
+    return new URL(value);
+  } catch {
+    return null;
+  }
+}
+
+function summarizeUrl(url) {
+  const keys = [];
+  try {
+    for (const key of url.searchParams.keys()) {
+      if (!keys.includes(key) && keys.length < 8) keys.push(key);
+    }
+  } catch {
+    return url.hostname;
+  }
+  return url.hostname + (keys.length ? ' query keys: ' + keys.join(',') : ' no query keys');
+}
+
+function suspiciousUrlExfiltration(url) {
+  let suspiciousKey = false;
+  let longValue = false;
+  let encodedShape = false;
+  const suspiciousNames = new Set(['data', 'token', 'secret', 'key', 'password', 'prompt', 'system', 'history', 'messages', 'context', 'payload', 'session']);
+  for (const [key, value] of url.searchParams.entries()) {
+    const lowerKey = key.toLowerCase();
+    if (suspiciousNames.has(lowerKey) || lowerKey.includes('token') || lowerKey.includes('secret') || lowerKey.includes('key')) suspiciousKey = true;
+    if (value.length >= 24) longValue = true;
+    if (/^[A-Za-z0-9_+/=-]{20,512}$/u.test(value)) encodedShape = true;
+  }
+  return { suspiciousKey, longValue, encodedShape, exfiltrating: suspiciousKey && (longValue || encodedShape) };
+}
+
+const MD_IMAGE_RE = /!\[[^\]\r\n]{0,200}\]\((https?:\/\/[^\s)]{1,1000})\)/gi;
+const DATA_URL_RE = /\bdata:([a-z0-9!#$&^_.+-]{1,80}\/[a-z0-9!#$&^_.+-]{1,80})?(;base64)?,[^\s)"'<>]{8,1000}/gi;
+const PRIVATE_KEY_RE = /-----BEGIN(?: [A-Z0-9]{1,30})? PRIVATE KEY-----/gi;
+const BEARER_RE = /\bauthorization[\t ]*:[\t ]*bearer[\t ]+([A-Za-z0-9._~+/=-]{8,256})/gi;
+const SECRET_ASSIGNMENT_RE = /\b(api[_-]?key|token|access[_-]?token|auth[_-]?token|secret|password|client[_-]?secret|private[_-]?token)\b[\t ]*[:=][\t ]*["']?([^"'\s,;]{8,256})/gi;
+const JSON_SECRET_RE = /["'](api[_-]?key|token|access[_-]?token|auth[_-]?token|secret|password|client[_-]?secret|private[_-]?token)["'][\t ]*:[\t ]*["']([^"']{8,256})["']/gi;
+const JWT_RE = /\beyJ[A-Za-z0-9_-]{10,256}\.[A-Za-z0-9_-]{10,256}\.[A-Za-z0-9_-]{8,256}\b/g;
+const EMAIL_RE = /\b[A-Z0-9._%+-]{1,64}@[A-Z0-9.-]{1,253}\.[A-Z]{2,24}\b/gi;
+const SSN_RE = /\b\d{3}-\d{2}-\d{4}\b/g;
+const CARDISH_RE = /(?:\d[ -]?){13,19}/g;
+const URL_RE = /\bhttps?:\/\/[^\s)"'<>]{4,1000}/gi;
+const TOKEN_RE = /[A-Za-z0-9_+./=-]{24,256}/g;
+
+function scanRegexWithMapper(input, regex, findings, mapper) {
+  regex.lastIndex = 0;
+  let match = regex.exec(input);
+  let count = 0;
+  while (match !== null && count < 12) {
+    const finding = mapper(match);
+    if (finding) pushCapped(findings, finding, 8);
+    count += 1;
+    if (match[0].length === 0) regex.lastIndex += 1;
+    match = regex.exec(input);
+  }
+}
+
+function shannonEntropy(text) {
+  const counts = new Map();
+  for (const ch of text) counts.set(ch, (counts.get(ch) || 0) + 1);
+  let entropy = 0;
+  for (const count of counts.values()) {
+    const p = count / text.length;
+    entropy -= p * Math.log2(p);
+  }
+  return entropy;
+}
+
+function characterClassCount(text) {
+  let classes = 0;
+  if (/[a-z]/u.test(text)) classes += 1;
+  if (/[A-Z]/u.test(text)) classes += 1;
+  if (/[0-9]/u.test(text)) classes += 1;
+  if (/[^A-Za-z0-9]/u.test(text)) classes += 1;
+  return classes;
+}
+
+function isHexLike(text) {
+  return /^[0-9a-fA-F]+$/u.test(text);
+}
+
+function luhnValid(digits) {
+  let sum = 0;
+  let doubleDigit = false;
+  for (let i = digits.length - 1; i >= 0; i -= 1) {
+    let value = digits.charCodeAt(i) - 48;
+    if (doubleDigit) {
+      value *= 2;
+      if (value > 9) value -= 9;
+    }
+    sum += value;
+    doubleDigit = !doubleDigit;
+  }
+  return sum % 10 === 0;
+}
+
+function overlapsExisting(findings, start, end, ids) {
+  for (const finding of findings) {
+    if (!ids.has(finding.id)) continue;
+    if (finding.start >= 0 && start < finding.end && end > finding.start) return true;
+  }
+  return false;
+}
+
+export function scanEgress(output, options) {
+  const opts = normalizeOptions(options);
+  assertBoundedString(output, opts, 'output');
+  const findings = [];
+
+  for (const canary of opts.canaryTokens) {
+    for (const start of findAllOccurrences(output, canary)) {
+      pushCapped(findings, makeFinding('GP-EGR-CANARY-001', 'Output contains a caller-registered canary token', 'canary token of length ' + canary.length, start, start + canary.length), 8);
+    }
+  }
+
+  scanRegexWithMapper(output, MD_IMAGE_RE, findings, (match) => {
+    const url = parseUrlSafely(match[1]);
+    if (!url) return null;
+    if (hostIsTrusted(url.hostname, opts.trustedImageHosts)) return null;
+    const severity = url.search.length > 0 ? 'high' : 'medium';
+    return makeFinding('GP-EGR-MARKDOWN-IMG-001', 'Markdown image URL can be used as a passive data-exfiltration channel', summarizeUrl(url), match.index, match.index + match[0].length, { severity });
+  });
+
+  scanRegexWithMapper(output, DATA_URL_RE, findings, (match) => {
+    const length = match[0].length;
+    const severity = length > 200 || /;base64/i.test(match[0]) ? 'high' : 'medium';
+    return makeFinding('GP-EGR-DATAURL-001', 'Suspicious data URL can embed hidden or browser-rendered content', 'data URL length ' + length, match.index, match.index + match[0].length, { severity });
+  });
+
+  scanRegexWithMapper(output, PRIVATE_KEY_RE, findings, (match) => makeFinding('GP-EGR-PRIVATEKEY-001', 'Output contains a private-key block boundary', match[0], match.index, match.index + match[0].length));
+  scanRegexWithMapper(output, BEARER_RE, findings, (match) => makeFinding('GP-EGR-CREDENTIAL-001', 'Output contains an authorization bearer credential', 'bearer credential length ' + match[1].length, match.index, match.index + match[0].length));
+  scanRegexWithMapper(output, SECRET_ASSIGNMENT_RE, findings, (match) => makeFinding('GP-EGR-CREDENTIAL-001', 'Output contains a secret-like credential assignment', match[1] + ' value length ' + match[2].length, match.index, match.index + match[0].length));
+  scanRegexWithMapper(output, JSON_SECRET_RE, findings, (match) => makeFinding('GP-EGR-CREDENTIAL-001', 'Output contains a serialized secret-like credential field', match[1] + ' value length ' + match[2].length, match.index, match.index + match[0].length));
+  scanRegexWithMapper(output, JWT_RE, findings, (match) => makeFinding('GP-EGR-CREDENTIAL-001', 'Output contains a three-part token shape', 'token length ' + match[0].length, match.index, match.index + match[0].length));
+
+  scanRegexWithMapper(output, EMAIL_RE, findings, (match) => makeFinding('GP-EGR-PII-001', 'Output contains an email address', match[0].replace(/^(.{1,2}).*(@.*)$/u, '$1***$2'), match.index, match.index + match[0].length));
+  scanRegexWithMapper(output, SSN_RE, findings, (match) => makeFinding('GP-EGR-PII-001', 'Output contains a national-identifier-shaped number', 'identifier pattern with length ' + match[0].length, match.index, match.index + match[0].length));
+
+  CARDISH_RE.lastIndex = 0;
+  let cardMatch = CARDISH_RE.exec(output);
+  let cards = 0;
+  while (cardMatch !== null && cards < 8) {
+    const digits = cardMatch[0].replace(/[^0-9]/g, '');
+    if (digits.length >= 13 && digits.length <= 19 && luhnValid(digits)) {
+      pushCapped(findings, makeFinding('GP-EGR-PII-001', 'Output contains a payment-card-shaped number that passes checksum validation', 'payment card length ' + digits.length, cardMatch.index, cardMatch.index + cardMatch[0].length), 8);
+    }
+    cards += 1;
+    cardMatch = CARDISH_RE.exec(output);
+  }
+
+  scanRegexWithMapper(output, URL_RE, findings, (match) => {
+    const url = parseUrlSafely(match[0]);
+    if (!url) return null;
+    const assessment = suspiciousUrlExfiltration(url);
+    if (!assessment.exfiltrating) return null;
+    return makeFinding('GP-EGR-URL-EXFIL-001', 'URL query has a sensitive key and an encoded or long value', summarizeUrl(url), match.index, match.index + match[0].length);
+  });
+
+  scanRegexWithMapper(output, TOKEN_RE, findings, (match) => {
+    const token = match[0];
+    const start = match.index;
+    const end = start + token.length;
+    if (overlapsExisting(findings, start, end, new Set(['GP-EGR-CREDENTIAL-001', 'GP-EGR-PRIVATEKEY-001', 'GP-EGR-URL-EXFIL-001', 'GP-EGR-MARKDOWN-IMG-001']))) return null;
+    const entropy = shannonEntropy(token);
+    const classes = characterClassCount(token);
+    const strongShape = token.length >= 32 && entropy >= 4.0 && classes >= 3;
+    const hexShape = token.length >= 40 && isHexLike(token) && entropy >= 3.4;
+    if (!strongShape && !hexShape) return null;
+    return makeFinding('GP-EGR-HIGHENTROPY-001', 'Output contains a high-entropy token-shaped value', 'length ' + token.length + ', entropy ' + entropy.toFixed(2), start, end);
+  });
+
+  findings.sort((a, b) => (a.start - b.start) || a.id.localeCompare(b.id));
+  return Object.freeze(findings);
+}
+
+export function inspectOutput(output, options) {
+  const opts = normalizeOptions(options);
+  assertBoundedString(output, opts, 'output');
+  const unicode = scanUnicode(output, opts);
+  const findings = [];
+  findings.push(...unicode.findings);
+  findings.push(...scanEgress(unicode.canonical, opts));
+  return finalizeReport('output', output, unicode.canonical, findings, opts, {
+    unicode: Object.freeze({ ...unicode.stats }),
+    hiddenSegmentCount: unicode.hiddenSegments.length
+  });
+}
+
+export function sanitizePrompt(input, options) {
+  return inspectPrompt(input, options).redacted;
+}
+
+export function sanitizeOutput(output, options) {
+  return inspectOutput(output, options).redacted;
+}
+
+export function assertSafePrompt(input, options) {
+  const report = inspectPrompt(input, options);
+  if (report.action === 'block') {
+    throwError(CODE.BLOCKED, 'input blocked by guardprompt policy', undefined, report.findings);
+  }
+  return report;
+}
+
+export function assertSafeOutput(output, options) {
+  const report = inspectOutput(output, options);
+  if (report.action === 'block') {
+    throwError(CODE.BLOCKED, 'output blocked by guardprompt policy', undefined, report.findings);
+  }
+  return report;
+}
+
+function mergeOptions(base, overrides) {
+  if (overrides === undefined) return base;
+  return normalizeOptions({ ...base, ...overrides });
+}
+
+export function createPromptFirewall(options) {
+  const base = normalizeOptions(options);
+  return Object.freeze({
+    inspectPrompt(input, overrides) {
+      return inspectPrompt(input, mergeOptions(base, overrides));
+    },
+    inspectOutput(output, overrides) {
+      return inspectOutput(output, mergeOptions(base, overrides));
+    },
+    sanitizePrompt(input, overrides) {
+      return inspectPrompt(input, mergeOptions(base, overrides)).redacted;
+    },
+    sanitizeOutput(output, overrides) {
+      return inspectOutput(output, mergeOptions(base, overrides)).redacted;
+    },
+    assertSafePrompt(input, overrides) {
+      const report = inspectPrompt(input, mergeOptions(base, overrides));
+      if (report.action === 'block') throwError(CODE.BLOCKED, 'input blocked by guardprompt policy', undefined, report.findings);
+      return report;
+    },
+    assertSafeOutput(output, overrides) {
+      const report = inspectOutput(output, mergeOptions(base, overrides));
+      if (report.action === 'block') throwError(CODE.BLOCKED, 'output blocked by guardprompt policy', undefined, report.findings);
+      return report;
+    },
+    scanUnicode(input, overrides) {
+      return scanUnicode(input, mergeOptions(base, overrides));
+    },
+    scanInjection(input, overrides) {
+      return scanInjection(input, mergeOptions(base, overrides));
+    },
+    scanEncoded(input, overrides) {
+      return scanEncoded(input, mergeOptions(base, overrides));
+    },
+    scanEgress(output, overrides) {
+      return scanEgress(output, mergeOptions(base, overrides));
+    }
+  });
+}
+
+const guardprompt = {
+  VERSION,
+  CODE,
+  DEFAULT_LIMITS,
+  RULES,
+  GuardPromptError,
+  normalizeOptions,
+  scanUnicode,
+  scanInjection,
+  scanEncoded,
+  scanEgress,
+  inspectPrompt,
+  inspectOutput,
+  sanitizePrompt,
+  sanitizeOutput,
+  assertSafePrompt,
+  assertSafeOutput,
+  createPromptFirewall
+};
+
+export default guardprompt;
