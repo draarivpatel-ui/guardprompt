@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 
-import { readFile } from 'node:fs/promises';
+import { createReadStream } from 'node:fs';
 import process from 'node:process';
-import { inspectPrompt, inspectOutput, VERSION } from '../src/index.mjs';
+import { DEFAULT_LIMITS, inspectPrompt, inspectOutput, VERSION } from '../src/index.mjs';
 
 function usage() {
   process.stderr.write([
@@ -30,10 +30,25 @@ function parseArgs(argv) {
   return parsed;
 }
 
-async function readStdin() {
+const MAX_CLI_INPUT_BYTES = DEFAULT_LIMITS.maxInputLength * 4 + 4;
+
+async function readStreamBounded(stream, noun) {
   const chunks = [];
-  for await (const chunk of process.stdin) chunks.push(Buffer.from(chunk));
+  let total = 0;
+  for await (const chunk of stream) {
+    total += chunk.length;
+    if (total > MAX_CLI_INPUT_BYTES) throw new Error(noun + ' exceeds the bounded CLI input byte limit');
+    chunks.push(Buffer.from(chunk));
+  }
   return Buffer.concat(chunks).toString('utf8');
+}
+
+async function readStdin() {
+  return readStreamBounded(process.stdin, 'standard input');
+}
+
+async function readFileBounded(file) {
+  return readStreamBounded(createReadStream(file), 'input file');
 }
 
 async function main() {
@@ -46,7 +61,7 @@ async function main() {
     process.stdout.write(VERSION + '\n');
     return 0;
   }
-  const text = args.file ? await readFile(args.file, 'utf8') : await readStdin();
+  const text = args.file ? await readFileBounded(args.file) : await readStdin();
   const report = args.output ? inspectOutput(text) : inspectPrompt(text);
   if (args.json) {
     process.stdout.write(JSON.stringify(report, null, 2) + '\n');

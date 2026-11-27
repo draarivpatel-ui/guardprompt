@@ -1,6 +1,7 @@
 # guardprompt
 
 [![CI](https://github.com/draarivpatel-ui/guardprompt/actions/workflows/ci.yml/badge.svg)](https://github.com/draarivpatel-ui/guardprompt/actions/workflows/ci.yml)
+[![OpenSSF Scorecard](https://api.securityscorecards.dev/projects/github.com/draarivpatel-ui/guardprompt/badge)](https://securityscorecards.dev/viewer/?uri=github.com/draarivpatel-ui/guardprompt)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Node.js](https://img.shields.io/badge/node-%3E%3D18-339933.svg)](package.json)
 [![Dependencies](https://img.shields.io/badge/dependencies-zero-success.svg)](package.json)

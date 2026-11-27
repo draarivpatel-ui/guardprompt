@@ -239,11 +239,11 @@ function isPrintableTagChar(cp) {
 }
 
 function isBidiControl(cp) {
-  return (cp >= 0x202A && cp <= 0x202E) || (cp >= 0x2066 && cp <= 0x2069);
+  return cp === 0x061C || (cp >= 0x202A && cp <= 0x202E) || (cp >= 0x2066 && cp <= 0x2069);
 }
 
 function isZeroWidth(cp) {
-  return cp === 0x180E || cp === 0x200B || cp === 0x200C || cp === 0x200D || cp === 0x200E || cp === 0x200F || cp === 0x2060 || cp === 0x2061 || cp === 0x2062 || cp === 0x2063 || cp === 0x2064 || cp === 0xFEFF;
+  return cp === 0x00AD || cp === 0x034F || cp === 0x180E || cp === 0x200B || cp === 0x200C || cp === 0x200D || cp === 0x200E || cp === 0x200F || cp === 0x2060 || cp === 0x2061 || cp === 0x2062 || cp === 0x2063 || cp === 0x2064 || cp === 0xFEFF;
 }
 
 function isVariationSelector(cp) {
@@ -637,11 +637,11 @@ function scanWindowedInstructionPatterns(lower, findings) {
 
 const ROLE_LINE_RE = /^[\t ]{0,12}(system|assistant|user|developer|tool|human|ai)[\t ]*:[\t ]*\S/i;
 const HEADING_RE = /^[\t ]{0,6}#{1,6}[\t ]+(system|instructions|system prompt|developer message)\b/i;
-const FENCE_RE = /```[\t ]*(system|instructions|prompt|json)\b/gi;
-const DOUBLE_ROLE_RE = /"role"[\t ]*:[\t ]*"(system|assistant|user|tool)"/gi;
-const SINGLE_ROLE_RE = /'role'[\t ]*:[\t ]*'(system|assistant|user|tool)'/gi;
+const FENCE_RE = /(?:`{3,}|~{3,})[\t ]*(system|instructions|prompt|json)\b/gi;
+const DOUBLE_ROLE_RE = /"role"[\t \r\n]*:[\t \r\n]*"(system|assistant|user|tool)"/gi;
+const SINGLE_ROLE_RE = /'role'[\t \r\n]*:[\t \r\n]*'(system|assistant|user|tool)'/gi;
 const INVOKE_RE = /<\/?(?:tool_call|function_call|tool_response|invoke|function_results?)\b[^>]{0,200}>/gi;
-const JSON_TOOL_RE = /"(?:tool_calls|function_call)"[\t ]*:/gi;
+const JSON_TOOL_RE = /"(?:tool_calls|function_call)"[\t \r\n]*:/gi;
 
 function scanRegexFindings(input, regex, id, description, findings, severityOverride) {
   regex.lastIndex = 0;
@@ -748,8 +748,9 @@ function decodeBase64Candidate(token, maxBytes) {
   while (padded.length % 4 !== 0) padded += '=';
   const bytes = Buffer.from(padded, 'base64');
   if (bytes.length === 0 || bytes.length > maxBytes) return null;
-  const canonical = bytes.toString('base64').replace(/=+$/u, '');
-  if (canonical !== token.replace(/=+$/u, '')) return null;
+  const canonicalPadded = bytes.toString('base64');
+  const canonicalUnpadded = canonicalPadded.replace(/=+$/u, '');
+  if (token !== canonicalPadded && token !== canonicalUnpadded) return null;
   const text = utf8Decode(bytes);
   if (text === null || !isMostlyPrintable(text)) return null;
   return text;
@@ -803,10 +804,6 @@ function percentDecodeCandidate(token, maxBytes) {
   return text;
 }
 
-function isTokenDelimiter(ch) {
-  return ch === undefined || /\s/u.test(ch) || ch === '"' || ch === "'" || ch === '`' || ch === '<' || ch === '>' || ch === '(' || ch === ')' || ch === '[' || ch === ']' || ch === '{' || ch === '}' || ch === ',';
-}
-
 function countPercentHexSequences(token) {
   let count = 0;
   for (let i = 0; i + 2 < token.length; i += 1) {
@@ -821,6 +818,11 @@ function encodedValueCharacter(ch) {
   return (cp >= 48 && cp <= 57) || (cp >= 65 && cp <= 90) || (cp >= 97 && cp <= 122) || ch === '+' || ch === '/' || ch === '%' || ch === '-' || ch === '.' || ch === '_' || ch === '~' || ch === '=';
 }
 
+function strictEncodedCoreCharacter(ch) {
+  const cp = ch.codePointAt(0);
+  return (cp >= 48 && cp <= 57) || (cp >= 65 && cp <= 90) || (cp >= 97 && cp <= 122) || ch === '+' || ch === '/';
+}
+
 function pushEncodedCandidate(tokens, seen, type, token, start, end) {
   if (!token || token.length > 2048) return;
   const key = start + ':' + end + ':' + type;
@@ -833,50 +835,65 @@ function pushEncodedCandidate(tokens, seen, type, token, start, end) {
   }
 }
 
-function addEmbeddedEncodedCandidates(tokens, seen, outerToken, outerStart) {
-  for (let index = 0; index < outerToken.length; index += 1) {
-    if (outerToken[index] !== '=') continue;
-    let end = index + 1;
-    while (end < outerToken.length && encodedValueCharacter(outerToken[end])) end += 1;
-    const value = outerToken.slice(index + 1, end);
-    if (value.length < 6) continue;
-    const absoluteStart = outerStart + index + 1;
-    const absoluteEnd = outerStart + end;
-    if (countPercentHexSequences(value) >= 2) {
-      pushEncodedCandidate(tokens, seen, 'url', value, absoluteStart, absoluteEnd);
+function addStrictEncodedRuns(tokens, seen, text, runStart) {
+  let tokenStart = -1;
+  let paddingSeen = false;
+
+  function flush(end) {
+    if (tokenStart !== -1) {
+      pushEncodedCandidate(tokens, seen, 'auto', text.slice(tokenStart, end), runStart + tokenStart, runStart + end);
+    }
+    tokenStart = -1;
+    paddingSeen = false;
+  }
+
+  for (let index = 0; index < text.length; index += 1) {
+    const ch = text[index];
+    if (strictEncodedCoreCharacter(ch)) {
+      if (tokenStart === -1) {
+        tokenStart = index;
+      } else if (paddingSeen) {
+        flush(index);
+        tokenStart = index;
+      }
+      paddingSeen = false;
+    } else if (ch === '=' && tokenStart !== -1) {
+      paddingSeen = true;
     } else {
-      pushEncodedCandidate(tokens, seen, 'auto', value, absoluteStart, absoluteEnd);
+      flush(index);
     }
   }
+  flush(text.length);
+}
+
+function addEncodedRun(tokens, seen, text, start, end) {
+  const run = text.slice(start, end);
+  if (!run) return;
+  if (countPercentHexSequences(run) >= 2) {
+    let offset = 0;
+    const assignment = run.lastIndexOf('=');
+    if (assignment >= 0 && countPercentHexSequences(run.slice(assignment + 1)) >= 2) offset = assignment + 1;
+    pushEncodedCandidate(tokens, seen, 'url', run.slice(offset), start + offset, end);
+    return;
+  }
+  addStrictEncodedRuns(tokens, seen, run, start);
 }
 
 function extractEncodedTokens(text) {
   const tokens = [];
   const seen = new Set();
   let start = -1;
-  let token = '';
 
   function flush(end) {
-    if (start !== -1 && token.length <= 2048) {
-      if (countPercentHexSequences(token) >= 2) {
-        pushEncodedCandidate(tokens, seen, 'url', token, start, end);
-      } else {
-        pushEncodedCandidate(tokens, seen, 'auto', token, start, end);
-      }
-      addEmbeddedEncodedCandidates(tokens, seen, token, start);
-    }
+    if (start !== -1) addEncodedRun(tokens, seen, text, start, end);
     start = -1;
-    token = '';
   }
 
   for (let i = 0; i < text.length; i += 1) {
     const ch = text[i];
     const cp = ch.codePointAt(0);
-    if (cp <= 127 && !isTokenDelimiter(ch) && ch !== '=') {
+    if (cp <= 127 && encodedValueCharacter(ch)) {
       if (start === -1) start = i;
-      token += ch;
-    } else if (cp <= 127 && ch === '=' && start !== -1) {
-      token += ch;
     } else {
       flush(i);
     }
@@ -1208,12 +1225,16 @@ function suspiciousUrlExfiltration(url) {
   return { suspiciousKey, longValue, encodedShape, exfiltrating: suspiciousKey && (longValue || encodedShape) };
 }
 
-const MD_IMAGE_RE = /!\[[^\]\r\n]{0,200}\]\((https?:\/\/[^\s)]{1,1000})\)/gi;
+const MD_IMAGE_RE = /!\[[^\]\r\n]{0,200}\]\([\t \r\n]{0,20}(?:<((?:https?:)?\/\/[^\s<>]{1,1000})>|((?:https?:)?\/\/[^\s)"']{1,1000}))/gi;
+const MD_IMAGE_REF_USE_RE = /!\[([^\]\r\n]{0,200})\][\t ]*\[([^\]\r\n]{0,120})\]/gi;
+const MD_IMAGE_SHORTCUT_RE = /!\[([^\]\r\n]{1,120})\](?![\t ]*[\[(])/gi;
+const MD_LINK_DEFINITION_RE = /^[\t ]{0,3}\[([^\]\r\n]{1,120})\]:[\t ]*(?:<((?:https?:)?\/\/[^\s<>]{1,1000})>|((?:https?:)?\/\/[^\s"']{1,1000}))/gim;
 const DATA_URL_RE = /\bdata:([a-z0-9!#$&^_.+-]{1,80}\/[a-z0-9!#$&^_.+-]{1,80})?(;base64)?,[^\s)"'<>]{8,1000}/gi;
 const PRIVATE_KEY_RE = /-----BEGIN(?: [A-Z0-9]{1,30})? PRIVATE KEY-----/gi;
 const BEARER_RE = /\bauthorization[\t ]*:[\t ]*bearer[\t ]+([A-Za-z0-9._~+/=-]{8,256})/gi;
-const SECRET_ASSIGNMENT_RE = /\b(api[_-]?key|token|access[_-]?token|auth[_-]?token|secret|password|client[_-]?secret|private[_-]?token)\b[\t ]*[:=][\t ]*["']?([^"'\s,;]{8,256})/gi;
-const JSON_SECRET_RE = /["'](api[_-]?key|token|access[_-]?token|auth[_-]?token|secret|password|client[_-]?secret|private[_-]?token)["'][\t ]*:[\t ]*["']([^"']{8,256})["']/gi;
+const SECRET_ASSIGNMENT_RE = /\b([A-Za-z][A-Za-z0-9_-]{0,80})[\t \r\n]*[:=][\t \r\n]*["']?([^"'\s,;]{8,256})/gi;
+const JSON_SECRET_RE = /["']([A-Za-z][A-Za-z0-9_-]{0,80})["'][\t \r\n]*:[\t \r\n]*["']([^"']{8,256})["']/gi;
+const VENDOR_SECRET_RE = /\b(?:sk-(?:proj-|ant-)?[A-Za-z0-9_-]{16,240}|sk_(?:live|test)_[A-Za-z0-9]{16,240}|ghp_[A-Za-z0-9]{20,255}|github_pat_[A-Za-z0-9_]{20,255}|tskey-[A-Za-z0-9-]{16,240}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{20,255}|xox[baprs]-[A-Za-z0-9-]{10,255})\b/g;
 const JWT_RE = /\beyJ[A-Za-z0-9_-]{10,256}\.[A-Za-z0-9_-]{10,256}\.[A-Za-z0-9_-]{8,256}\b/g;
 const EMAIL_RE = /\b[A-Z0-9._%+-]{1,64}@[A-Z0-9.-]{1,253}\.[A-Z]{2,24}\b/gi;
 const SSN_RE = /\b\d{3}-\d{2}-\d{4}\b/g;
@@ -1281,6 +1302,67 @@ function overlapsExisting(findings, start, end, ids) {
   return false;
 }
 
+function isSensitiveKeyName(key) {
+  const normalized = key.toLowerCase().replace(/-/g, '_');
+  return normalized.includes('token') || normalized.includes('secret') || normalized.includes('password') || normalized.includes('api_key') || normalized.includes('apikey');
+}
+
+function markdownImageFinding(value, start, end, opts) {
+  const normalizedValue = value.startsWith('//') ? 'https:' + value : value;
+  const url = parseUrlSafely(normalizedValue);
+  if (!url || (url.protocol !== 'https:' && url.protocol !== 'http:')) return null;
+  if (hostIsTrusted(url.hostname, opts.trustedImageHosts)) return null;
+  const severity = url.search.length > 0 ? 'high' : 'medium';
+  return makeFinding('GP-EGR-MARKDOWN-IMG-001', 'Markdown image URL can be used as a passive data-exfiltration channel', summarizeUrl(url), start, end, { severity });
+}
+
+function normalizeMarkdownLabel(value) {
+  return value.trim().replace(/[\t \r\n]+/g, ' ').toLowerCase();
+}
+
+function markdownReferenceLabels(output) {
+  const labels = new Set();
+  MD_IMAGE_REF_USE_RE.lastIndex = 0;
+  let match = MD_IMAGE_REF_USE_RE.exec(output);
+  let count = 0;
+  while (match !== null && count < 32) {
+    const label = match[2].length > 0 ? match[2] : match[1];
+    const normalized = normalizeMarkdownLabel(label);
+    if (normalized) labels.add(normalized);
+    count += 1;
+    match = MD_IMAGE_REF_USE_RE.exec(output);
+  }
+
+  MD_IMAGE_SHORTCUT_RE.lastIndex = 0;
+  match = MD_IMAGE_SHORTCUT_RE.exec(output);
+  count = 0;
+  while (match !== null && count < 32) {
+    const normalized = normalizeMarkdownLabel(match[1]);
+    if (normalized) labels.add(normalized);
+    count += 1;
+    match = MD_IMAGE_SHORTCUT_RE.exec(output);
+  }
+  return labels;
+}
+
+function scanMarkdownReferenceImages(output, opts, findings) {
+  const labels = markdownReferenceLabels(output);
+  if (labels.size === 0) return;
+  MD_LINK_DEFINITION_RE.lastIndex = 0;
+  let match = MD_LINK_DEFINITION_RE.exec(output);
+  let count = 0;
+  while (match !== null && count < 12) {
+    const label = normalizeMarkdownLabel(match[1]);
+    if (labels.has(label)) {
+      const value = match[2] || match[3];
+      const finding = markdownImageFinding(value, match.index, match.index + match[0].length, opts);
+      if (finding) pushCapped(findings, finding, 8);
+    }
+    count += 1;
+    match = MD_LINK_DEFINITION_RE.exec(output);
+  }
+}
+
 export function scanEgress(output, options) {
   const opts = normalizeOptions(options);
   assertBoundedString(output, opts, 'output');
@@ -1292,13 +1374,8 @@ export function scanEgress(output, options) {
     }
   }
 
-  scanRegexWithMapper(output, MD_IMAGE_RE, findings, (match) => {
-    const url = parseUrlSafely(match[1]);
-    if (!url) return null;
-    if (hostIsTrusted(url.hostname, opts.trustedImageHosts)) return null;
-    const severity = url.search.length > 0 ? 'high' : 'medium';
-    return makeFinding('GP-EGR-MARKDOWN-IMG-001', 'Markdown image URL can be used as a passive data-exfiltration channel', summarizeUrl(url), match.index, match.index + match[0].length, { severity });
-  });
+  scanRegexWithMapper(output, MD_IMAGE_RE, findings, (match) => markdownImageFinding(match[1] || match[2], match.index, match.index + match[0].length, opts));
+  scanMarkdownReferenceImages(output, opts, findings);
 
   scanRegexWithMapper(output, DATA_URL_RE, findings, (match) => {
     const length = match[0].length;
@@ -1308,9 +1385,21 @@ export function scanEgress(output, options) {
 
   scanRegexWithMapper(output, PRIVATE_KEY_RE, findings, (match) => makeFinding('GP-EGR-PRIVATEKEY-001', 'Output contains a private-key block boundary', match[0], match.index, match.index + match[0].length));
   scanRegexWithMapper(output, BEARER_RE, findings, (match) => makeFinding('GP-EGR-CREDENTIAL-001', 'Output contains an authorization bearer credential', 'bearer credential length ' + match[1].length, match.index, match.index + match[0].length));
-  scanRegexWithMapper(output, SECRET_ASSIGNMENT_RE, findings, (match) => makeFinding('GP-EGR-CREDENTIAL-001', 'Output contains a secret-like credential assignment', match[1] + ' value length ' + match[2].length, match.index, match.index + match[0].length));
-  scanRegexWithMapper(output, JSON_SECRET_RE, findings, (match) => makeFinding('GP-EGR-CREDENTIAL-001', 'Output contains a serialized secret-like credential field', match[1] + ' value length ' + match[2].length, match.index, match.index + match[0].length));
+  scanRegexWithMapper(output, SECRET_ASSIGNMENT_RE, findings, (match) => {
+    if (!isSensitiveKeyName(match[1])) return null;
+    return makeFinding('GP-EGR-CREDENTIAL-001', 'Output contains a secret-like credential assignment', match[1] + ' value length ' + match[2].length, match.index, match.index + match[0].length);
+  });
+  scanRegexWithMapper(output, JSON_SECRET_RE, findings, (match) => {
+    if (!isSensitiveKeyName(match[1])) return null;
+    return makeFinding('GP-EGR-CREDENTIAL-001', 'Output contains a serialized secret-like credential field', match[1] + ' value length ' + match[2].length, match.index, match.index + match[0].length);
+  });
   scanRegexWithMapper(output, JWT_RE, findings, (match) => makeFinding('GP-EGR-CREDENTIAL-001', 'Output contains a three-part token shape', 'token length ' + match[0].length, match.index, match.index + match[0].length));
+  scanRegexWithMapper(output, VENDOR_SECRET_RE, findings, (match) => {
+    const start = match.index;
+    const end = start + match[0].length;
+    if (overlapsExisting(findings, start, end, new Set(['GP-EGR-CREDENTIAL-001']))) return null;
+    return makeFinding('GP-EGR-CREDENTIAL-001', 'Output contains a vendor-specific credential shape', 'vendor credential length ' + match[0].length, start, end);
+  });
 
   scanRegexWithMapper(output, EMAIL_RE, findings, (match) => makeFinding('GP-EGR-PII-001', 'Output contains an email address', match[0].replace(/^(.{1,2}).*(@.*)$/u, '$1***$2'), match.index, match.index + match[0].length));
   scanRegexWithMapper(output, SSN_RE, findings, (match) => makeFinding('GP-EGR-PII-001', 'Output contains a national-identifier-shaped number', 'identifier pattern with length ' + match[0].length, match.index, match.index + match[0].length));

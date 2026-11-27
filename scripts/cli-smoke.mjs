@@ -23,4 +23,9 @@ assert.ok(report.findings.length > 0);
 const output = spawnSync(process.execPath, [bin, '--output'], { input: 'api_key = cage-test-token-abcdef123456', encoding: 'utf8' });
 assert.equal(output.status, 2, output.stderr);
 
+
+const oversized = spawnSync(process.execPath, [bin], { input: 'x'.repeat(500000), encoding: 'utf8' });
+assert.equal(oversized.status, 64, oversized.stderr);
+assert.match(oversized.stderr, /bounded CLI input byte limit|exceeds maxInputLength/);
+
 process.stdout.write('guardprompt CLI smoke checks passed\n');
