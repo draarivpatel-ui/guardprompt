@@ -216,3 +216,18 @@ test('soft hyphen and grapheme joiner are stripped as invisible characters', () 
     assert.equal(scan.canonical.includes(cp(codePoint)), false);
   }
 });
+
+test('unicode finding positions refer to canonical offsets after nfkc expansion', () => {
+  const scan = scanUnicode('\uFB01' + cp(0x200B) + '\u0430');
+  const zeroWidth = scan.findings.find((finding) => finding.id === 'GP-UNI-ZW-001');
+  const confusable = scan.findings.find((finding) => finding.id === 'GP-UNI-CONFUSE-001');
+  assert.equal(scan.canonical, 'fia');
+  assert.equal(zeroWidth.start, 2);
+  assert.equal(confusable.start, 2);
+});
+
+test('redaction after nfkc expansion does not consume canonical prefix characters', () => {
+  const report = inspectPrompt('\uFB01' + cp(0x200B) + '<|im_start|>');
+  assert.equal(report.canonical, 'fi<|im_start|>');
+  assert.ok(report.redacted.startsWith('fi[redacted]'), report.redacted);
+});

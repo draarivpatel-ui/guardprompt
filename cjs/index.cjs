@@ -452,49 +452,47 @@ function scanUnicode(input, options) {
   const confusableExamples = [];
   const tagData = decodeTagRuns(input);
   counts.tags = tagData.count;
-  firstPositions.tags = tagData.first;
-
-  let utf16Index = 0;
-  for (const ch of input) {
-    const cp = ch.codePointAt(0);
-    if (isBidiControl(cp)) {
-      counts.bidi += 1;
-      if (firstPositions.bidi === -1) firstPositions.bidi = utf16Index;
-    }
-    if (isZeroWidth(cp)) {
-      counts.zeroWidth += 1;
-      if (firstPositions.zeroWidth === -1) firstPositions.zeroWidth = utf16Index;
-    }
-    if (isVariationSelector(cp)) {
-      counts.variationSelectors += 1;
-      if (firstPositions.variationSelectors === -1) firstPositions.variationSelectors = utf16Index;
-    }
-    if (isRestrictedControl(cp)) {
-      counts.controls += 1;
-      if (firstPositions.controls === -1) firstPositions.controls = utf16Index;
-    }
-    utf16Index += ch.length;
-  }
 
   const normalized = opts.normalizeUnicode ? input.normalize('NFKC') : input;
   let canonical = '';
-  utf16Index = 0;
+  let canonicalIndex = 0;
   for (const ch of normalized) {
     const cp = ch.codePointAt(0);
-    if (isTagChar(cp) || isBidiControl(cp) || isZeroWidth(cp) || isVariationSelector(cp) || isRestrictedControl(cp)) {
-      utf16Index += ch.length;
+    if (isTagChar(cp)) {
+      if (firstPositions.tags === -1) firstPositions.tags = canonicalIndex;
+      continue;
+    }
+    if (isBidiControl(cp)) {
+      counts.bidi += 1;
+      if (firstPositions.bidi === -1) firstPositions.bidi = canonicalIndex;
+      continue;
+    }
+    if (isZeroWidth(cp)) {
+      counts.zeroWidth += 1;
+      if (firstPositions.zeroWidth === -1) firstPositions.zeroWidth = canonicalIndex;
+      continue;
+    }
+    if (isVariationSelector(cp)) {
+      counts.variationSelectors += 1;
+      if (firstPositions.variationSelectors === -1) firstPositions.variationSelectors = canonicalIndex;
+      continue;
+    }
+    if (isRestrictedControl(cp)) {
+      counts.controls += 1;
+      if (firstPositions.controls === -1) firstPositions.controls = canonicalIndex;
       continue;
     }
     const replacement = CONFUSABLE_MAP[ch];
     if (replacement !== undefined) {
       counts.confusables += 1;
-      if (firstPositions.confusables === -1) firstPositions.confusables = utf16Index;
+      if (firstPositions.confusables === -1) firstPositions.confusables = canonicalIndex;
       if (confusableExamples.length < 8) confusableExamples.push(hexCodePoint(cp) + '->' + replacement);
       canonical += replacement;
+      canonicalIndex += replacement.length;
     } else {
       canonical += ch;
+      canonicalIndex += ch.length;
     }
-    utf16Index += ch.length;
   }
 
   const findings = [];
@@ -1001,7 +999,13 @@ function collectEncodedLayer(text, path, depth, state, opts, findings, payloads)
       { path: nextPath.slice(), decodedLength: decoded.length }
     ));
 
-    const nested = scanInjection(decoded, opts);
+    const unicodeOptions = normalizeOptions({ ...opts, maxInputLength: Math.max(opts.maxInputLength, decoded.length) });
+    const decodedUnicode = scanUnicode(decoded, unicodeOptions);
+    const nested = [...decodedUnicode.findings];
+    for (const segment of decodedUnicode.hiddenSegments) {
+      nested.push(...scanInjection(segment.text, unicodeOptions));
+    }
+    nested.push(...scanInjection(decodedUnicode.canonical, unicodeOptions));
     if (nested.length > 0) {
       findings.push(makeFinding(
         'GP-ENC-NEST-001',
@@ -1015,7 +1019,7 @@ function collectEncodedLayer(text, path, depth, state, opts, findings, payloads)
         findings.push(cloneNestedFinding(nestedFinding, nextPath, type));
       }
     }
-    collectEncodedLayer(decoded, nextPath, depth + 1, state, opts, findings, payloads);
+    collectEncodedLayer(decodedUnicode.canonical, nextPath, depth + 1, state, opts, findings, payloads);
   }
 
   if (text.length >= 8 && /[A-Za-z]/u.test(text)) {
